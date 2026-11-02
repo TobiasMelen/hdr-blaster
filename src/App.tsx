@@ -1,10 +1,28 @@
-import React, { useRef, useState, useEffect, useMemo } from "react";
+import { useRef, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { Canvas, extend, useFrame, useThree, type Catalogue } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three/webgpu";
-import { mix, normalWorldGeometry, output, smoothstep, vec4 } from "three/tsl";
+import {
+  color,
+  mix,
+  normalMap,
+  normalWorldGeometry,
+  output,
+  positionWorld,
+  smoothstep,
+  texture,
+  uniform,
+  max,
+  vec2,
+  vec4,
+} from "three/tsl";
 import { useControls } from "leva";
 import WebGPUGrass, { type GrassLook } from "./WebGPUGrass";
+import { ISO_OFFSET, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { noise } from "./tslNoise";
+import { raindrops } from "./rain";
+import Lasers, { SelectiveBloom } from "./Lasers";
+import { ClusteredLighting } from "./lighting/ClusteredLighting";
+import { bareGround, pathInset } from "./worldMap";
 
 // Make R3F intrinsic elements resolve to the WebGPU build of three
 extend(THREE as unknown as Catalogue);
@@ -26,17 +44,19 @@ const SCENES: Record<string, ScenePreset> = {
   Day: {
     background: "#c2e2ff",
     ambient: { color: "#ffffff", intensity: 0.4 },
-    light: { position: [10, 10, 5], color: "#FFFFCC", intensity: 1 },
-    grass: { specular: "#55554a", shininess: 30, tipTint: [1.0, 0.9, 0.6], translucency: 0.35 },
+    // From the upper left of the iso view, low enough to rake across the
+    // path relief and partly behind the grass for the backlit glow
+    light: { position: [-10, 7, 1.4], color: "#FFFFCC", intensity: 1 },
+    grass: { specular: "#55554a", shininess: 30, tipTint: [1.0, 0.9, 0.6], translucency: 0.35, wetness: 0 },
   },
   Moon: {
     background: "#070b16",
     fog: { color: "#070b16", near: 60, far: 150 },
     ambient: { color: "#7086cc", intensity: 1.4 },
     // Same general direction as the Day sun
-    light: { position: [45, 50, 22], color: "#b4d6c4", intensity: 1.6 },
-    moon: { position: [225, 250, 110], radius: 9, color: "#eef2ff" },
-    grass: { specular: "#90a89a", shininess: 24, tipTint: [0.75, 0.85, 1.0], translucency: 0 },
+    light: { position: [-49, 50, 7], color: "#b4d6c4", intensity: 1.6 },
+    moon: { position: [-245, 250, 35], radius: 9, color: "#eef2ff" },
+    grass: { specular: "#b8ccc0", shininess: 20, tipTint: [0.75, 0.85, 1.0], translucency: 0, wetness: 1 },
   },
 };
 
@@ -69,16 +89,108 @@ function SceneLighting({ preset }: { preset: ScenePreset }) {
   );
 }
 
-const Ground = React.forwardRef(({ fieldSize = 50 }, ref) => {
+// Brown Mud 03 by Rob Tuytel, Poly Haven (CC0). Scanned at 1.3 m, drawn
+// larger so the cracks read at iso distance
+const GRAVEL_TILE = 8;
+
+function loadTiling(url: string, colorSpace: string) {
+  const map = new THREE.TextureLoader().load(url);
+  map.wrapS = map.wrapT = THREE.RepeatWrapping;
+  map.colorSpace = colorSpace;
+  map.anisotropy = 8;
+  return map;
+}
+
+// Ground plane that travels with the ball, so the field never ends. Shows
+// gravel where the world map has paths
+function Ground({ groundRef, follow, lightColor }) {
+  const light = useMemo(() => uniform(new THREE.Color()), []);
+  const time = useMemo(() => uniform(0), []);
+  useEffect(() => {
+    light.value.set(lightColor);
+  }, [light, lightColor]);
+
+  const material = useMemo(() => {
+    const gravelColor = loadTiling(
+      "/textures/brown_mud_03_diff_1k.jpg",
+      THREE.SRGBColorSpace
+    );
+    const gravelNormal = loadTiling(
+      "/textures/brown_mud_03_nor_gl_1k.jpg",
+      THREE.NoColorSpace
+    );
+    // Packed ambient occlusion, roughness, metalness
+    const gravelArm = loadTiling(
+      "/textures/brown_mud_03_arm_1k.jpg",
+      THREE.NoColorSpace
+    );
+
+    const mat = new THREE.MeshStandardNodeMaterial({ roughness: 1 });
+    const xz = positionWorld.xz;
+    // World xz mapped to follow the plane's own uv axes (v runs along -z),
+    // so the normal map's tangent frame lines up
+    const gravelUv = vec2(xz.x, xz.y.negate()).div(GRAVEL_TILE);
+    const bare = bareGround(xz);
+
+    const arm = texture(gravelArm, gravelUv);
+    const occlusion = mix(1.0, arm.r, bare);
+
+    // Random dark spots break up the flat dirt: damp blotches around half a
+    // metre across, and small specks like pebble shadows
+    const blotches = smoothstep(0.55, 0.75, noise(xz.mul(1.4).add(17.0)));
+    const specks = smoothstep(0.7, 0.85, noise(xz.mul(9.0)));
+    const spots = mix(1.0, 0.5, blotches).mul(mix(1.0, 0.6, specks));
+
+    // Puddles in the middle of paths, ringed by darker wet dirt
+    const puddleNoise = noise(xz.mul(0.45).add(vec2(-31.0, 8.0)));
+    const deepEnough = smoothstep(0.35, 0.6, pathInset(xz));
+    const puddle = smoothstep(0.65, 0.7, puddleNoise).mul(deepEnough);
+    const wet = smoothstep(0.56, 0.68, puddleNoise).mul(deepEnough);
+
+    // Broad light and dark patches hide the tiling
+    const gravel = texture(gravelColor, gravelUv)
+      .rgb.mul(noise(xz.mul(0.15)).mul(0.3).add(0.85))
+      .mul(spots)
+      .mul(mix(1.0, 0.55, wet));
+    // Fake shadow from the grass: the path darkens towards its edges
+    const grassShadow = mix(0.2, 1.0, pathInset(xz));
+    // Occlusion also goes into the colour at half strength, since ambient
+    // light alone (the only light aoNode affects) is too weak to make the
+    // cracks read. Puddles are black smooth metal, so only sun glints and
+    // the raindrop rings show on them
+    const dirt = mix(color("#232712"), gravel.mul(grassShadow), bare).mul(
+      mix(1.0, occlusion, 0.5)
+    );
+    mat.colorNode = mix(dirt, color("#000000"), puddle);
+    mat.aoNode = occlusion;
+    mat.metalnessNode = puddle;
+    mat.roughnessNode = mix(mix(1.0, arm.g, bare), 0.05, max(puddle, wet.mul(0.5)));
+    // Raindrop rings catch the moon/sunlight
+    mat.emissiveNode = light.mul(raindrops(xz, time).mul(0.45)).mul(puddle);
+    // Doubled normal strength so the relief reads from the iso distance;
+    // water lies flat
+    mat.normalNode = normalMap(
+      texture(gravelNormal, gravelUv),
+      vec2(bare.mul(2.0).mul(puddle.oneMinus()))
+    );
+    return mat;
+  }, [light, time]);
+  useEffect(() => () => material.dispose(), [material]);
+
+  useFrame((state) => {
+    time.value = state.clock.elapsedTime;
+    groundRef.current?.position.set(follow.x, -0.01, follow.z);
+  });
+
   return (
-    <mesh ref={ref} rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.01, 0]}>
-      <planeGeometry args={[fieldSize, fieldSize]} key={fieldSize} />
-      <meshStandardMaterial color="#232712" />
+    <mesh ref={groundRef} rotation={[-Math.PI / 2, 0, 0]}>
+      <planeGeometry args={[200, 200]} />
+      <primitive object={material} attach="material" />
     </mesh>
   );
-});
+}
 
-function KineticSphere({ onPositionChange, groundRef }) {
+function KineticSphere({ onPositionChange }) {
   const meshRef = useRef<THREE.Mesh>(null);
 
   const material = useMemo(() => {
@@ -95,8 +207,6 @@ function KineticSphere({ onPositionChange, groundRef }) {
   useEffect(() => () => material.dispose(), [material]);
   const velocity = useRef(new THREE.Vector3());
   const keys = useRef({ w: false, a: false, s: false, d: false });
-  const mouseTarget = useRef(null);
-  const isMousePressed = useRef(false);
 
   useEffect(() => {
     const handleKeyDown = (event) => {
@@ -133,74 +243,26 @@ function KineticSphere({ onPositionChange, groundRef }) {
       }
     };
 
-    const handleMouseDown = () => {
-      isMousePressed.current = true;
-    };
-
-    const handleMouseUp = () => {
-      isMousePressed.current = false;
-      mouseTarget.current = null;
-    };
-
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
-    window.addEventListener("mousedown", handleMouseDown);
-    window.addEventListener("mouseup", handleMouseUp);
-    window.addEventListener("touchstart", handleMouseDown);
-    window.addEventListener("touchend", handleMouseUp);
 
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
-      window.removeEventListener("mousedown", handleMouseDown);
-      window.removeEventListener("mouseup", handleMouseUp);
-      window.removeEventListener("touchstart", handleMouseDown);
-      window.removeEventListener("touchend", handleMouseUp);
     };
   }, []);
 
   useFrame((state, delta) => {
     if (!meshRef.current) return;
 
-    // Handle mouse raycasting for ground clicks
-    if (isMousePressed.current && groundRef?.current) {
-      const raycaster = new THREE.Raycaster();
-      const mouse = new THREE.Vector2();
-
-      // Calculate mouse position in normalized device coordinates
-      mouse.x = state.pointer.x;
-      mouse.y = state.pointer.y;
-
-      raycaster.setFromCamera(mouse, state.camera);
-
-      // Intersect with ground mesh
-      const intersects = raycaster.intersectObject(groundRef.current);
-
-      if (intersects.length > 0) {
-        mouseTarget.current = intersects[0].point;
-      }
-    }
-
     const force = new THREE.Vector3();
     const forceStrength = 8; // Reduced for heavier feel
 
-    // Apply forces based on key input
-    if (keys.current.w) force.z -= forceStrength;
-    if (keys.current.s) force.z += forceStrength;
-    if (keys.current.a) force.x -= forceStrength;
-    if (keys.current.d) force.x += forceStrength;
-
-    // Apply mouse-directed force
-    if (mouseTarget.current && isMousePressed.current) {
-      const direction = mouseTarget.current
-        .clone()
-        .sub(meshRef.current.position);
-      direction.y = 0; // Only horizontal movement
-      direction.normalize();
-
-      // Use same force strength as keyboard
-      force.add(direction.multiplyScalar(forceStrength));
-    }
+    // Apply forces based on key input, along the screen's ground axes
+    const up = (keys.current.w ? 1 : 0) - (keys.current.s ? 1 : 0);
+    const right = (keys.current.d ? 1 : 0) - (keys.current.a ? 1 : 0);
+    force.x += (ISO_UP[0] * up + ISO_RIGHT[0] * right) * forceStrength;
+    force.z += (ISO_UP[1] * up + ISO_RIGHT[1] * right) * forceStrength;
 
     // Apply physics with more momentum
     velocity.current.add(force.multiplyScalar(delta));
@@ -239,82 +301,51 @@ function KineticSphere({ onPositionChange, groundRef }) {
   );
 }
 
-function CameraController({ spherePosition, cameraMode }) {
-  const { camera } = useThree();
-  const orbitRef = useRef();
+// Fixed isometric orthographic camera that glides after the ball
+function IsoCamera({ target }: { target: THREE.Vector3 }) {
+  const camera = useThree((state) => state.camera);
+  const height = useThree((state) => state.size.height);
+  const focus = useRef(target.clone());
 
-  useFrame(() => {
-    if (cameraMode === "third-person" && spherePosition) {
-      // Change FOV for third-person mode
-      camera.fov = 70;
-      camera.updateProjectionMatrix();
+  useLayoutEffect(() => {
+    camera.zoom = height / ISO_VIEW_HEIGHT;
+    camera.updateProjectionMatrix();
+  }, [camera, height]);
 
-      // Third-person camera follows sphere - closer to ground
-      const offset = new THREE.Vector3(0, 2.5, 6);
-      const targetPosition = spherePosition.clone().add(offset);
+  // Runs before the default frame callbacks, so the grass places its slot
+  // grid for this frame's camera rather than last frame's
+  useFrame((_, delta) => {
+    focus.current.lerp(target, 1 - Math.exp(-delta * 4));
+    camera.position.set(...ISO_OFFSET).add(focus.current);
+    camera.lookAt(focus.current);
+  }, -1);
 
-      camera.position.lerp(targetPosition, 0.1);
-      camera.lookAt(spherePosition.x, spherePosition.y, spherePosition.z);
-    } else if (cameraMode === "orbit") {
-      // Reset FOV for orbit mode
-      camera.fov = 20;
-      camera.updateProjectionMatrix();
-    }
-  });
-
-  return cameraMode === "orbit" ? (
-    <OrbitControls
-      ref={orbitRef}
-      minPolarAngle={0}
-      maxPolarAngle={Math.PI / 2.1}
-      enableDamping
-    />
-  ) : null;
+  return null;
 }
 
 export default function App() {
   const [spherePosition, setSpherePosition] = useState(
     new THREE.Vector3(0, 1.0, 0)
   );
-  const [cameraMode, setCameraMode] = useState("orbit"); // 'orbit' or 'third-person'
   const groundRef = useRef();
-
-  
 
   // Project description in Leva
   const { Scene: sceneName } = useControls("Controls", {
     "Controls": {
-      value: "WASD/Mouse: Move ball, C: Toggle camera",
+      value: "WASD: Move ball, Mouse: Shoot",
       editable: false
     },
-    Scene: { value: "Day", options: Object.keys(SCENES) },
+    Scene: { value: "Moon", options: Object.keys(SCENES) },
   });
   const scene = SCENES[sceneName];
 
-  // Get fieldSize from Grass component's Leva controls
-  const { "Field Size": fieldSize } = useControls("🌿 Grass Field", {
-    "Blade Count": { value: 80_000, min: 1000, max: 500_000, step: 10_000 },
-    "Blade Height": { value: 1.3, min: 0.7, max: 4.0, step: 0.1 },
-    "Field Size": { value: 50, min: 10, max: 200, step: 5 },
-    "Wind Speed": { value: 1.0, min: 0.0, max: 2.0, step: 0.1 },
-  });
-
-
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (event.code === "KeyC") {
-        setCameraMode((prev) => (prev === "orbit" ? "third-person" : "orbit"));
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
-
   return (
     <div style={{ width: "100vw", height: "100vh" }}>
+      {/* flat: no tone mapping, so values above 1 reach HDR displays */}
       <Canvas
-        camera={{ position: [55, 30, 55], fov: 20 }}
+        flat
+        orthographic
+        camera={{ position: ISO_OFFSET, near: 1, far: 200 }}
         style={{
           userSelect: "none",
           WebkitUserSelect: "none",
@@ -326,24 +357,29 @@ export default function App() {
             antialias: true,
             alpha: false,
             powerPreference: "high-performance",
+            // Half-float canvas with extended tone mapping: HDR output on
+            // displays and browsers that support it, plain SDR elsewhere
+            outputType: THREE.HalfFloatType,
           });
+          // Point lights (the laser bolts) only shade the pixels they reach
+          renderer.lighting = new ClusteredLighting();
           await renderer.init();
           return renderer;
         }}
       >
         <SceneLighting key={sceneName} preset={scene} />
 
-        <Ground ref={groundRef} fieldSize={fieldSize} />
-        <WebGPUGrass spherePosition={spherePosition} look={scene.grass} sunPosition={scene.light.position} />
-        <KineticSphere
-          onPositionChange={setSpherePosition}
+        <Ground
           groundRef={groundRef}
+          follow={spherePosition}
+          lightColor={scene.light.color}
         />
+        <WebGPUGrass spherePosition={spherePosition} look={scene.grass} sunPosition={scene.light.position} />
+        <KineticSphere onPositionChange={setSpherePosition} />
+        <Lasers origin={spherePosition} />
+        <SelectiveBloom />
 
-        <CameraController
-          spherePosition={spherePosition}
-          cameraMode={cameraMode}
-        />
+        <IsoCamera target={spherePosition} />
       </Canvas>
     </div>
   );

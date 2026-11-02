@@ -32,48 +32,27 @@ import {
   varying,
   select,
   int,
-  positionWorld,
-  cameraPosition,
   saturate,
 } from "three/tsl";
+import { ISO_ELEVATION, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { hash12, hash22, noise } from "./tslNoise";
+import { bareGround } from "./worldMap";
 
-// Trail map resolution (cells per side) and the ball's stamp radius
+// Trail map resolution (cells per side), the world size it wraps over and
+// the ball's stamp radius
 const TRAIL_RES = 512;
+const TRAIL_SIZE = 50;
+const TRAIL_TEXEL = TRAIL_SIZE / TRAIL_RES;
 const TRAIL_RADIUS = 1.45;
 
-// Hash functions for pseudo-random numbers
-const hash11 = Fn(([pIn]: [THREE.Node<"float">]) => {
-  const p = fract(pIn.mul(0.1031)).toVar();
-  p.mulAssign(p.add(33.33));
-  p.mulAssign(p.add(p));
-  return fract(p);
-});
+// Blades lean past the edges of their footprint by up to this much: wind
+// (~1.4 m at full gust on soft blades), trail push (1.3 m) and rest bend
+const BEND_MARGIN = 3.0;
 
-const hash12 = Fn(([p]: [THREE.Node<"vec2">]) => {
-  const p3 = fract(vec3(p.x, p.y, p.x).mul(0.1031)).toVar();
-  p3.addAssign(dot(p3, p3.yzx.add(33.33)));
-  return fract(p3.x.add(p3.y).mul(p3.z));
-});
-
-const hash22 = Fn(([p]: [THREE.Node<"vec2">]) => {
-  const p3 = fract(vec3(p.x, p.y, p.x).mul(vec3(0.1031, 0.103, 0.0973))).toVar();
-  p3.addAssign(dot(p3, p3.yzx.add(33.33)));
-  return fract(p3.xx.add(p3.yz).mul(p3.zy));
-});
-
-// Simple value noise
-const noise = Fn(([p]: [THREE.Node<"vec2">]) => {
-  const i = floor(p);
-  const f = fract(p);
-  const a = hash12(i);
-  const b = hash12(i.add(vec2(1.0, 0.0)));
-  const c = hash12(i.add(vec2(0.0, 1.0)));
-  const d = hash12(i.add(vec2(1.0, 1.0)));
-  const u = f.mul(f).mul(f.mul(-2.0).add(3.0));
-  return mix(a, b, u.x)
-    .add(c.sub(a).mul(u.y).mul(u.x.oneMinus()))
-    .add(d.sub(b).mul(u.x).mul(u.y));
-});
+// The view's ground axes, and the ground direction towards the camera
+const viewRight = vec2(...ISO_RIGHT);
+const viewUp = vec2(...ISO_UP);
+const towardCamera = viewUp.negate();
 
 function createBladeGeometry(bladeCount: number) {
   const width = 0.1;
@@ -127,24 +106,31 @@ function createBladeGeometry(bladeCount: number) {
 function createGrass(bladeCount: number) {
   const uniforms = {
     time: uniform(0),
-    fieldSize: uniform(50),
+    // Bottom-left cell of the slot grid in the view's ground grid, its
+    // width in slots and the cell size
+    gridOrigin: uniform(new THREE.Vector2()),
+    gridWidth: uniform(1),
+    cellSize: uniform(0.13),
     windSpeed: uniform(1),
     grassHeight: uniform(1.3),
-    cameraPos: uniform(new THREE.Vector3()),
     spherePosition: uniform(new THREE.Vector3(0, 1, 0)),
     previousSpherePosition: uniform(new THREE.Vector3(0, 1, 0)),
     trailFadeStep: uniform(0),
     tipTint: uniform(new THREE.Vector3(1.0, 0.9, 0.6)),
     sunDirection: uniform(new THREE.Vector3(0, 1, 0)),
     translucency: uniform(0),
+    wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
     ridge: uniform(0.6),
   };
 
-  // Trail map over the field: each cell holds the xz push vector (bend
-  // direction scaled by strength) that blades rooted there get, plus a life
-  // that counts down from 1 so the blades recover with an ease-out
+  // Trail map that wraps around the world, so it covers the ball wherever it
+  // rolls: each cell holds the xz push vector (bend direction scaled by
+  // strength) that blades rooted there get, a life that counts down from 1
+  // so the blades recover with an ease-out, and the id of the world tile it
+  // currently covers, so cells reused for a new tile read as empty
   const trailMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec4");
+  const tileId = (tile: THREE.Node<"vec2">) => tile.x.mul(4096.0).add(tile.y);
 
   // Springs up fast, then settles gently into rest over a fixed time
   const recovery = (life: THREE.Node<"float">) => life.mul(life);
@@ -159,9 +145,20 @@ function createGrass(bladeCount: number) {
       float(instanceIndex.mod(TRAIL_RES)),
       float(instanceIndex.div(TRAIL_RES))
     );
-    const cellPos = cell.add(0.5).div(TRAIL_RES).sub(0.5).mul(uniforms.fieldSize);
+    // World position of this cell in the tile nearest the ball
+    const tilePos = cell.add(0.5).mul(TRAIL_TEXEL);
+    const tile = floor(
+      uniforms.spherePosition.xz.sub(tilePos).div(TRAIL_SIZE).add(0.5)
+    ).toVar();
+    const cellPos = tilePos.add(tile.mul(TRAIL_SIZE));
+    const id = tileId(tile).toVar();
+
     const trail = trailMap.element(instanceIndex);
-    const life = max(trail.z.sub(uniforms.trailFadeStep), 0.0);
+    const life = select(
+      trail.w.equal(id),
+      max(trail.z.sub(uniforms.trailFadeStep), 0.0),
+      0.0
+    ).toVar();
     const current = trail.xy.mul(recovery(life)).toVar();
 
     // Capsule from last frame's ball position to this frame's, so fast
@@ -186,86 +183,87 @@ function createGrass(bladeCount: number) {
     trail.assign(
       select(
         dot(stamp, stamp).greaterThan(dot(current, current)),
-        vec4(stamp, 1.0, 0.0),
-        vec4(trail.xy, life, 0.0)
+        vec4(stamp, 1.0, id),
+        vec4(trail.xy, life, id)
       )
     );
   })().compute(TRAIL_RES * TRAIL_RES);
 
-  // Bilinear sample of the trail map at a world xz position
+  // Bilinear sample of the trail push at a world xz position
   const sampleTrail = Fn(([pos]: [THREE.Node<"vec2">]) => {
-    const coord = pos.div(uniforms.fieldSize).add(0.5).mul(TRAIL_RES).sub(0.5);
+    const coord = pos.div(TRAIL_TEXEL).sub(0.5);
     const f = fract(coord);
-    const c0 = clamp(floor(coord), 0.0, TRAIL_RES - 1);
-    const c1 = clamp(floor(coord).add(1.0), 0.0, TRAIL_RES - 1);
-    const at = (x: THREE.Node<"float">, y: THREE.Node<"float">) =>
-      trailMap.element(int(y).mul(TRAIL_RES).add(int(x)));
-    const trail = mix(
-      mix(at(c0.x, c0.y), at(c1.x, c0.y), f.x),
-      mix(at(c0.x, c1.y), at(c1.x, c1.y), f.x),
+    const c0 = floor(coord);
+    // Unwrapped cell -> push, or none if the cell holds another tile
+    const at = (c: THREE.Node<"vec2">) => {
+      const tile = floor(c.div(TRAIL_RES));
+      const wrapped = c.sub(tile.mul(TRAIL_RES));
+      const trail = trailMap.element(
+        int(wrapped.y).mul(TRAIL_RES).add(int(wrapped.x))
+      );
+      return select(
+        trail.w.equal(tileId(tile)),
+        trail.xy.mul(recovery(trail.z)),
+        vec2(0.0)
+      );
+    };
+    return mix(
+      mix(at(c0), at(c0.add(vec2(1.0, 0.0))), f.x),
+      mix(at(c0.add(vec2(0.0, 1.0))), at(c0.add(vec2(1.0, 1.0))), f.x),
       f.y
     );
-    return trail.xy.mul(recovery(trail.z));
   });
-
-  // Static per-blade data, written by the init pass (compute-only)
-  const bladeBase = instancedArray(bladeCount, "vec4"); // posX, posZ, cosRot, sinRot
-  const bladeShape = instancedArray(bladeCount, "vec4"); // height, width, restBend.xz
-  const bladeParams = instancedArray(bladeCount, "vec2"); // stiffness, colorVar
 
   // Per-frame per-blade data, packed for the vertex shader (3 vec4 per vertex)
   const bladeXform = instancedArray(bladeCount, "vec4"); // posX, posZ, scaled blade x axis
   const bladeBend = instancedArray(bladeCount, "vec4"); // linear bend.xz, cubic droop, height
-  const bladeLook = instancedArray(bladeCount, "vec4"); // restBend.xz, colorVar, shade
+  const bladeLook = instancedArray(bladeCount, "vec4"); // restBend.xz, colorVar + dryness, shade
 
-  const init = Fn(() => {
+  // Everything that only depends on the blade (not the vertex) is computed
+  // once per blade here, instead of once per vertex in the vertex shader
+  const update = Fn(() => {
+    // Each slot covers one cell of a world-locked grid along the view's
+    // ground axes. The slot grid follows the camera, and every blade
+    // property hashes from the cell, so blades stay put as it scrolls
     const idx = float(instanceIndex);
+    const row = floor(idx.add(0.5).div(uniforms.gridWidth));
+    const cell = uniforms.gridOrigin
+      .add(vec2(idx.sub(row.mul(uniforms.gridWidth)), row))
+      .toVar();
+    const local = cell.add(hash22(cell)).mul(uniforms.cellSize);
+    const grassPos = viewRight.mul(local.x).add(viewUp.mul(local.y)).toVar();
 
-    const randPos = hash22(vec2(idx.mul(0.0013), idx.mul(0.0017)));
-    const pos = randPos.sub(0.5).mul(uniforms.fieldSize);
+    // Paths: blades thin out towards bare ground, the survivors shorter and
+    // drier; culled blades collapse to zero size
+    const bare = bareGround(grassPos).toVar();
+    const culled = hash12(cell.add(vec2(-63.7, 29.1))).lessThan(bare);
+    const pathScale = select(culled, 0.0, bare.mul(-0.6).add(1.0));
 
-    const sizeVars = hash22(vec2(idx.mul(0.0019), idx.mul(0.0023)));
-    const heightVar = uniforms.grassHeight.add(sizeVars.x.mul(0.8));
-    const widthVar = sizeVars.y.mul(0.6).add(0.7);
-    const stiffness = hash11(idx.mul(0.0071)).mul(0.8).add(0.5);
-    const randomRotation = hash11(idx.mul(0.0037)).mul(6.28318);
+    const sizeVars = hash22(cell.add(vec2(37.1, 11.7)));
+    const heightVar = uniforms.grassHeight
+      .add(sizeVars.x.mul(0.8))
+      .mul(pathScale)
+      .toVar();
+    const widthVar = sizeVars.y.mul(0.6).add(0.7).mul(select(culled, 0.0, 1.0));
+    const motionVars = hash22(cell.add(vec2(-19.3, 53.9)));
+    const stiffness = motionVars.x.mul(0.8).add(0.5);
+    const randomRotation = motionVars.y.mul(6.28318);
+    const cosRot = cos(randomRotation).toVar();
+    const sinRot = sin(randomRotation).toVar();
 
     // Random initial bend - gives blades natural resting position.
     // Pre-scaled by height; vertex applies it with a uv.y^2 curve
-    const bendVars = hash22(vec2(idx.mul(0.0041), idx.mul(0.0047)));
+    const bendVars = hash22(cell.add(vec2(71.3, -43.1)));
     const bendAngle = bendVars.x.mul(6.28318);
     const restBend = vec2(cos(bendAngle), sin(bendAngle))
       .mul(bendVars.y.mul(0.25))
       .mul(heightVar);
 
-    const colorVar = hash11(idx.mul(0.0031));
-
-    bladeBase
-      .element(instanceIndex)
-      .assign(vec4(pos, cos(randomRotation), sin(randomRotation)));
-    bladeShape.element(instanceIndex).assign(vec4(heightVar, widthVar, restBend));
-    bladeParams.element(instanceIndex).assign(vec2(stiffness, colorVar));
-  })().compute(bladeCount);
-
-  // Everything that only depends on the blade (not the vertex) is computed
-  // once per blade here, instead of once per vertex in the vertex shader
-  const update = Fn(() => {
-    const base = bladeBase.element(instanceIndex);
-    const grassPos = base.xy;
-    const cosRot = base.z;
-    const sinRot = base.w;
-    const shape = bladeShape.element(instanceIndex);
-    const heightVar = shape.x;
-    const widthVar = shape.y;
-    const restBend = shape.zw;
-    const params = bladeParams.element(instanceIndex);
-    const stiffness = params.x;
-    const colorVar = params.y;
+    const colorVar = hash12(cell.add(vec2(5.7, 97.3)));
 
     // View-space thickening
-    const viewDirXZ = normalize(uniforms.cameraPos.xz.sub(grassPos));
     const grassFaceNormal = vec2(sinRot.negate(), cosRot);
-    const viewDotNormal = clamp(abs(dot(grassFaceNormal, viewDirXZ)), 0.0, 1.0);
+    const viewDotNormal = clamp(abs(dot(grassFaceNormal, towardCamera)), 0.0, 1.0);
     const thicken = pow(viewDotNormal.oneMinus(), 2.0);
 
     // Wind system
@@ -303,7 +301,7 @@ function createGrass(bladeCount: number) {
     // thickening or they smear into wide ribbons
     const upright = smoothstep(0.0, 0.8, length(trailBend)).oneMinus();
     const xAxis = vec2(cosRot, sinRot).mul(
-      widthVar.add(thicken.mul(4.0).mul(upright))
+      widthVar.add(thicken.mul(4.0).mul(upright)).mul(select(culled, 0.0, 1.0))
     );
 
     // Shadow effect from sphere
@@ -316,7 +314,10 @@ function createGrass(bladeCount: number) {
       .assign(vec4(linearBend, droop, heightVar));
     bladeLook
       .element(instanceIndex)
-      .assign(vec4(restBend, colorVar, shadowStrength.oneMinus()));
+      .assign(
+        // Dryness packed into the integer part of the colour variation
+        vec4(restBend, colorVar.mul(0.999).add(floor(bare.mul(15.0))), shadowStrength.oneMinus())
+      );
   })().compute(bladeCount);
 
   const xform = bladeXform.toAttribute();
@@ -349,10 +350,15 @@ function createGrass(bladeCount: number) {
 
   // Lighting modifier with yellow tint at tips - all in vertex
   const color = Fn(() => {
-    const colorVar = look.z;
+    const colorVar = fract(look.z);
+    const dryness = floor(look.z).div(15.0);
     const shade = look.w;
-    const tint = vec3(0.12, 0.62, 0.12).add(
-      vec3(0.1, 0.3, 0.05).mul(colorVar.sub(0.5).mul(2.0))
+    const tint = mix(
+      vec3(0.12, 0.62, 0.12).add(
+        vec3(0.1, 0.3, 0.05).mul(colorVar.sub(0.5).mul(2.0))
+      ),
+      vec3(0.42, 0.45, 0.14),
+      dryness.mul(0.7)
     );
 
     const linearModifier = uvY.add(0.1);
@@ -364,7 +370,9 @@ function createGrass(bladeCount: number) {
       uniforms.tipTint,
       smoothstep(1.0, 1.5, lightIntensity)
     );
-    return tint.mul(shade).mul(lightColor).mul(lightIntensity);
+    // Wet blades soak up light, going darker
+    const wetDarken = mix(1.0, 0.75, uniforms.wetness);
+    return tint.mul(shade).mul(lightColor).mul(lightIntensity).mul(wetDarken);
   })();
 
   const axis = normalize(xform.zw);
@@ -407,9 +415,8 @@ function createGrass(bladeCount: number) {
   // turned with their back to the sun light up, each with a lime streak
   // down its middle fading to green edges
   const backlight = Fn(() => {
-    const toFragment = normalize(positionWorld.xz.sub(cameraPosition.xz));
     const sunXZ = normalize(uniforms.sunDirection.xz);
-    const against = smoothstep(-0.3, 1.0, dot(toFragment, sunXZ));
+    const against = smoothstep(-0.3, 1.0, dot(viewUp, sunXZ));
     const cameraSideFace = varying(faceNormal).normalize().mul(faceDirection);
     const facing = saturate(dot(cameraSideFace.xz, sunXZ).negate());
     const across = abs(uv().x.sub(0.5)).mul(2.0);
@@ -424,14 +431,16 @@ function createGrass(bladeCount: number) {
   material.colorNode = varying(color);
   material.normalNode = normal;
   material.emissiveNode = backlight;
-  // Fake AO: speculars strongest at the tips, fading into the dense base
-  material.specularNode = uniforms.specular.mul(smoothstep(0.0, 1.0, uvY));
+  // Fake AO: speculars strongest at the tips, fading into the dense base.
+  // Wet blades shine further down
+  material.specularNode = uniforms.specular.mul(
+    smoothstep(uniforms.wetness.mul(-0.6), 1.0, uvY)
+  );
 
-  const buffers = [bladeBase, bladeShape, bladeParams, bladeXform, bladeBend, bladeLook];
+  const buffers = [bladeXform, bladeBend, bladeLook];
 
   return {
     uniforms,
-    init,
     clearTrail,
     stampTrail,
     update,
@@ -450,7 +459,11 @@ export type GrassLook = {
   tipTint: [number, number, number];
   // Strength of the backlit glow, 0 disables it
   translucency: number;
+  // 0 dry to 1 soaked: darker blades, gloss further down the blade
+  wetness: number;
 };
+
+const viewDirection = new THREE.Vector3();
 
 export default function WebGPUGrass({
   spherePosition,
@@ -462,23 +475,40 @@ export default function WebGPUGrass({
   sunPosition: [number, number, number];
 }) {
   const renderer = useThree((state) => state.gl) as unknown as THREE.WebGPURenderer;
-  const needsInit = useRef(true);
+  const size = useThree((state) => state.size);
+  const needsClear = useRef(true);
 
   const {
-    "Blade Count": bladeCount,
-    "Field Size": fieldSize,
+    Density: density,
     "Blade Height": bladeHeight,
     "Wind Speed": windSpeedLeva,
     "Trail Recovery": trailRecovery,
     "Blade Ridge": bladeRidge,
   } = useControls("🌿 Grass Field", {
-    "Blade Count": { value: 150000, min: 1000, max: 500000, step: 1000 },
+    Density: { value: 60, min: 10, max: 200, step: 5 },
     "Blade Height": { value: 1.3, min: 0.7, max: 4.0, step: 0.1 },
-    "Field Size": { value: 50, min: 10, max: 200, step: 5 },
     "Wind Speed": { value: 1.3, min: 0.0, max: 5.0, step: 0.1 },
     "Trail Recovery": { value: 3.0, min: 0.2, max: 20.0, step: 0.1 },
     "Blade Ridge": { value: 0.6, min: 0.0, max: 1.0, step: 0.05 },
   });
+
+  // Slot grid covering the ground the fixed iso view sees, in the view's
+  // ground axes relative to the point at the centre of the screen
+  const grid = useMemo(() => {
+    const cellSize = 1 / Math.sqrt(density);
+    const width = (ISO_VIEW_HEIGHT * size.width) / size.height + 2 * BEND_MARGIN;
+    const depth = ISO_VIEW_HEIGHT / Math.sin(ISO_ELEVATION);
+    // Blades rooted below the bottom edge still reach up into view
+    const nearMargin = (bladeHeight + 0.8) / Math.tan(ISO_ELEVATION) + BEND_MARGIN;
+    return {
+      cellSize,
+      columns: Math.ceil(width / cellSize),
+      rows: Math.ceil((depth + nearMargin + BEND_MARGIN) / cellSize),
+      minRight: -width / 2,
+      minUp: -depth / 2 - nearMargin,
+    };
+  }, [density, bladeHeight, size.width, size.height]);
+  const bladeCount = grid.columns * grid.rows;
 
   const geometry = useMemo(() => createBladeGeometry(bladeCount), [bladeCount]);
   const grass = useMemo(() => createGrass(bladeCount), [bladeCount]);
@@ -486,12 +516,15 @@ export default function WebGPUGrass({
   useEffect(() => () => geometry.dispose(), [geometry]);
   useEffect(() => () => grass.dispose(), [grass]);
 
-  // Static blade data only changes with these, so re-run the init pass
   useEffect(() => {
-    grass.uniforms.fieldSize.value = fieldSize;
+    needsClear.current = true;
+  }, [grass]);
+
+  useEffect(() => {
+    grass.uniforms.gridWidth.value = grid.columns;
+    grass.uniforms.cellSize.value = grid.cellSize;
     grass.uniforms.grassHeight.value = bladeHeight;
-    needsInit.current = true;
-  }, [grass, fieldSize, bladeHeight]);
+  }, [grass, grid, bladeHeight]);
 
   useEffect(() => {
     grass.uniforms.windSpeed.value = windSpeedLeva;
@@ -506,13 +539,26 @@ export default function WebGPUGrass({
     grass.material.shininess = look.shininess;
     grass.uniforms.tipTint.value.fromArray(look.tipTint);
     grass.uniforms.translucency.value = look.translucency;
+    grass.uniforms.wetness.value = look.wetness;
     grass.uniforms.sunDirection.value.fromArray(sunPosition).normalize();
   }, [grass, look, sunPosition]);
 
   useFrame((state, delta) => {
     const { uniforms } = grass;
     uniforms.time.value = state.clock.elapsedTime;
-    uniforms.cameraPos.value.copy(state.camera.position);
+
+    // Ground point at the centre of the screen, in view ground axes
+    const { camera } = state;
+    camera.getWorldDirection(viewDirection);
+    const t = -camera.position.y / viewDirection.y;
+    const centerX = camera.position.x + viewDirection.x * t;
+    const centerZ = camera.position.z + viewDirection.z * t;
+    const right = centerX * ISO_RIGHT[0] + centerZ * ISO_RIGHT[1];
+    const up = centerX * ISO_UP[0] + centerZ * ISO_UP[1];
+    uniforms.gridOrigin.value.set(
+      Math.floor((right + grid.minRight) / grid.cellSize),
+      Math.floor((up + grid.minUp) / grid.cellSize)
+    );
 
     uniforms.trailFadeStep.value = delta / trailRecovery;
 
@@ -521,10 +567,9 @@ export default function WebGPUGrass({
       uniforms.spherePosition.value.copy(spherePosition);
     }
 
-    if (needsInit.current) {
-      renderer.compute(grass.init);
+    if (needsClear.current) {
       renderer.compute(grass.clearTrail);
-      needsInit.current = false;
+      needsClear.current = false;
     }
     renderer.compute(grass.stampTrail);
     renderer.compute(grass.update);
