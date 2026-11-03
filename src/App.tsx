@@ -1,26 +1,27 @@
-import { useRef, useState, useEffect, useLayoutEffect, useMemo } from "react";
+import { Suspense, useRef, useState, useEffect, useLayoutEffect, useMemo } from "react";
 import { Canvas, extend, useFrame, useThree, type Catalogue } from "@react-three/fiber";
 import * as THREE from "three/webgpu";
 import {
   color,
   mix,
   normalMap,
-  normalWorldGeometry,
-  output,
   positionWorld,
   smoothstep,
   texture,
   uniform,
   max,
   vec2,
-  vec4,
 } from "three/tsl";
 import { useControls } from "leva";
 import WebGPUGrass, { type GrassLook } from "./WebGPUGrass";
-import { ISO_OFFSET, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { ISO_OFFSET, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { noise } from "./tslNoise";
 import { raindrops } from "./rain";
-import Lasers, { SelectiveBloom } from "./Lasers";
+import Lasers, { SelectiveBloom, type Aim } from "./Lasers";
+import Character from "./Character";
+import Enemies from "./Enemies";
+import { BoltPool } from "./bolts";
+import { Stains } from "./stains";
 import { ClusteredLighting } from "./lighting/ClusteredLighting";
 import { bareGround, pathInset } from "./worldMap";
 
@@ -52,9 +53,9 @@ const SCENES: Record<string, ScenePreset> = {
   Moon: {
     background: "#070b16",
     fog: { color: "#070b16", near: 60, far: 150 },
-    ambient: { color: "#7086cc", intensity: 1.4 },
+    ambient: { color: "#6e80d8", intensity: 1.25 },
     // Same general direction as the Day sun
-    light: { position: [-49, 50, 7], color: "#b4d6c4", intensity: 1.6 },
+    light: { position: [-49, 50, 7], color: "#b4d6c4", intensity: 1.45 },
     moon: { position: [-245, 250, 35], radius: 9, color: "#eef2ff" },
     grass: { specular: "#b8ccc0", shininess: 20, tipTint: [0.75, 0.85, 1.0], translucency: 0, wetness: 1 },
   },
@@ -190,122 +191,24 @@ function Ground({ groundRef, follow, lightColor }) {
   );
 }
 
-function KineticSphere({ onPositionChange }) {
-  const meshRef = useRef<THREE.Mesh>(null);
+// Fixed isometric orthographic camera that glides after the character
+const aimAhead = new THREE.Vector3();
+const screenUp = new THREE.Vector3(ISO_UP[0], 0, ISO_UP[1]);
+const view = new THREE.Vector3();
 
-  const material = useMemo(() => {
-    const mat = new THREE.MeshStandardNodeMaterial({
-      roughness: 0.3,
-      metalness: 0.1,
-      color: "#F44",
-    });
-    // Fake ambient occlusion - darken the underside of the ball
-    const bottomFactor = smoothstep(-0.5, 0.2, normalWorldGeometry.y);
-    mat.outputNode = vec4(output.rgb.mul(mix(0.3, 1.0, bottomFactor)), output.a);
-    return mat;
-  }, []);
-  useEffect(() => () => material.dispose(), [material]);
-  const velocity = useRef(new THREE.Vector3());
-  const keys = useRef({ w: false, a: false, s: false, d: false });
+// Leads ahead of the character towards the mouse, so more of the view lies
+// where it's looking. Eased slower than the follow, so it swings after a turn
+const LOOK_AHEAD = 5; // metres
+// Extra lead along the screen's vertical, which the view foreshortens
+const LOOK_AHEAD_VERTICAL = 2.2;
+const LOOK_AHEAD_RATE = 1.8; // per second
+const FOLLOW_RATE = 4; // per second
 
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      switch (event.code) {
-        case "KeyW":
-          keys.current.w = true;
-          break;
-        case "KeyA":
-          keys.current.a = true;
-          break;
-        case "KeyS":
-          keys.current.s = true;
-          break;
-        case "KeyD":
-          keys.current.d = true;
-          break;
-      }
-    };
-
-    const handleKeyUp = (event) => {
-      switch (event.code) {
-        case "KeyW":
-          keys.current.w = false;
-          break;
-        case "KeyA":
-          keys.current.a = false;
-          break;
-        case "KeyS":
-          keys.current.s = false;
-          break;
-        case "KeyD":
-          keys.current.d = false;
-          break;
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-    };
-  }, []);
-
-  useFrame((state, delta) => {
-    if (!meshRef.current) return;
-
-    const force = new THREE.Vector3();
-    const forceStrength = 8; // Reduced for heavier feel
-
-    // Apply forces based on key input, along the screen's ground axes
-    const up = (keys.current.w ? 1 : 0) - (keys.current.s ? 1 : 0);
-    const right = (keys.current.d ? 1 : 0) - (keys.current.a ? 1 : 0);
-    force.x += (ISO_UP[0] * up + ISO_RIGHT[0] * right) * forceStrength;
-    force.z += (ISO_UP[1] * up + ISO_RIGHT[1] * right) * forceStrength;
-
-    // Apply physics with more momentum
-    velocity.current.add(force.multiplyScalar(delta));
-    velocity.current.multiplyScalar(0.98); // Much less friction for longer coasting
-
-    // Update position
-    meshRef.current.position.add(
-      velocity.current.clone().multiplyScalar(delta)
-    );
-
-    // Keep sphere on ground
-    meshRef.current.position.y = 1.0; // New sphere radius
-
-    // Rotation based on movement
-    const speed = velocity.current.length();
-    if (speed > 0.05) {
-      const axis = new THREE.Vector3(
-        -velocity.current.z,
-        0,
-        velocity.current.x
-      ).normalize();
-      meshRef.current.rotateOnAxis(axis, speed * delta * 0.05);
-    }
-
-    // Notify parent of position change
-    if (onPositionChange) {
-      onPositionChange(meshRef.current.position);
-    }
-  });
-
-  return (
-    <mesh ref={meshRef} position={[0, 1.0, 0]}>
-      <sphereGeometry args={[1.0, 32, 32]} />
-      <primitive object={material} attach="material" />
-    </mesh>
-  );
-}
-
-// Fixed isometric orthographic camera that glides after the ball
-function IsoCamera({ target }: { target: THREE.Vector3 }) {
+function IsoCamera({ target, aim }: { target: THREE.Vector3; aim: Aim }) {
   const camera = useThree((state) => state.camera);
   const height = useThree((state) => state.size.height);
   const focus = useRef(target.clone());
+  const lead = useRef(new THREE.Vector3());
 
   useLayoutEffect(() => {
     camera.zoom = height / ISO_VIEW_HEIGHT;
@@ -315,24 +218,44 @@ function IsoCamera({ target }: { target: THREE.Vector3 }) {
   // Runs before the default frame callbacks, so the grass places its slot
   // grid for this frame's camera rather than last frame's
   useFrame((_, delta) => {
-    focus.current.lerp(target, 1 - Math.exp(-delta * 4));
-    camera.position.set(...ISO_OFFSET).add(focus.current);
-    camera.lookAt(focus.current);
+    focus.current.lerp(target, 1 - Math.exp(-delta * FOLLOW_RATE));
+    lead.current.lerp(
+      aimAhead
+        .copy(aim.direction)
+        .addScaledVector(
+          screenUp,
+          aim.direction.dot(screenUp) * (LOOK_AHEAD_VERTICAL - 1)
+        )
+        .multiplyScalar(LOOK_AHEAD),
+      1 - Math.exp(-delta * LOOK_AHEAD_RATE)
+    );
+    view.copy(focus.current).add(lead.current);
+    camera.position.set(...ISO_OFFSET).add(view);
+    camera.lookAt(view);
   }, -1);
 
   return null;
 }
 
 export default function App() {
-  const [spherePosition, setSpherePosition] = useState(
-    new THREE.Vector3(0, 1.0, 0)
-  );
+  // Mutated every frame by the character; everything else reads it
+  const [playerPosition] = useState(() => new THREE.Vector3());
+  const [aim] = useState<Aim>(() => ({
+    active: false,
+    direction: new THREE.Vector3(0, 0, 1),
+    shots: 0,
+    muzzle: new THREE.Vector3(),
+  }));
+  const [bolts] = useState(() => new BoltPool());
+  // Everything that flattens the grass: the player, and enemies while around
+  const [grassPushers] = useState(() => new Set([playerPosition]));
+  const [stains] = useState(() => new Stains());
   const groundRef = useRef();
 
   // Project description in Leva
   const { Scene: sceneName } = useControls("Controls", {
     "Controls": {
-      value: "WASD: Move ball, Mouse: Shoot",
+      value: "WASD: Move, Mouse: Shoot",
       editable: false
     },
     Scene: { value: "Moon", options: Object.keys(SCENES) },
@@ -371,15 +294,18 @@ export default function App() {
 
         <Ground
           groundRef={groundRef}
-          follow={spherePosition}
+          follow={playerPosition}
           lightColor={scene.light.color}
         />
-        <WebGPUGrass spherePosition={spherePosition} look={scene.grass} sunPosition={scene.light.position} />
-        <KineticSphere onPositionChange={setSpherePosition} />
-        <Lasers origin={spherePosition} />
+        <WebGPUGrass spherePosition={playerPosition} pushers={grassPushers} stains={stains} look={scene.grass} sunPosition={scene.light.position} />
+        <Suspense fallback={null}>
+          <Character position={playerPosition} aim={aim} bolts={bolts} />
+          <Enemies player={playerPosition} bolts={bolts} grassPushers={grassPushers} stains={stains} />
+        </Suspense>
+        <Lasers origin={playerPosition} aim={aim} bolts={bolts} />
         <SelectiveBloom />
 
-        <IsoCamera target={spherePosition} />
+        <IsoCamera target={playerPosition} aim={aim} />
       </Canvas>
     </div>
   );

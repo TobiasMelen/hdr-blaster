@@ -37,16 +37,23 @@ import {
 import { ISO_ELEVATION, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
 import { bareGround } from "./worldMap";
+import type { Stains } from "./stains";
 
-// Trail map resolution (cells per side), the world size it wraps over and
-// the ball's stamp radius
+// Trail map resolution (cells per side), the world size it wraps over (so
+// it holds trails within half that of the player) and the stamp radius
 const TRAIL_RES = 512;
-const TRAIL_SIZE = 50;
+const TRAIL_SIZE = 80;
 const TRAIL_TEXEL = TRAIL_SIZE / TRAIL_RES;
-const TRAIL_RADIUS = 1.45;
+const TRAIL_RADIUS = 1.0;
+// How hard the stamp pushes blades over at its centre
+const TRAIL_PUSH = 0.95;
+// Most things pushing the grass at once (the player and the enemies)
+const MAX_PUSHERS = 6;
+// Where unused pusher slots sit, far from any grass
+const NOWHERE = 1e6;
 
 // Blades lean past the edges of their footprint by up to this much: wind
-// (~1.4 m at full gust on soft blades), trail push (1.3 m) and rest bend
+// (~1.4 m at full gust on soft blades), trail push (up to TRAIL_PUSH m) and rest bend
 const BEND_MARGIN = 3.0;
 
 // The view's ground axes, and the ground direction towards the camera
@@ -103,7 +110,7 @@ function createBladeGeometry(bladeCount: number) {
   return geom;
 }
 
-function createGrass(bladeCount: number) {
+function createGrass(bladeCount: number, stains: Stains) {
   const uniforms = {
     time: uniform(0),
     // Bottom-left cell of the slot grid in the view's ground grid, its
@@ -114,7 +121,10 @@ function createGrass(bladeCount: number) {
     windSpeed: uniform(1),
     grassHeight: uniform(1.3),
     spherePosition: uniform(new THREE.Vector3(0, 1, 0)),
-    previousSpherePosition: uniform(new THREE.Vector3(0, 1, 0)),
+    // Each pusher's path this frame: last frame's xz then this frame's
+    pushers: Array.from({ length: MAX_PUSHERS }, () =>
+      uniform(new THREE.Vector4(NOWHERE, NOWHERE, NOWHERE, NOWHERE))
+    ),
     trailFadeStep: uniform(0),
     tipTint: uniform(new THREE.Vector3(1.0, 0.9, 0.6)),
     sunDirection: uniform(new THREE.Vector3(0, 1, 0)),
@@ -122,6 +132,8 @@ function createGrass(bladeCount: number) {
     wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
     ridge: uniform(0.6),
+    // Blood splats: x, z, radius, seed (the Stains' own vectors)
+    stains: stains.spots.map((spot) => uniform(spot)),
   };
 
   // Trail map that wraps around the world, so it covers the ball wherever it
@@ -139,7 +151,7 @@ function createGrass(bladeCount: number) {
     trailMap.element(instanceIndex).assign(vec4(0.0));
   })().compute(TRAIL_RES * TRAIL_RES);
 
-  // Fade the map back towards rest, then stamp the ball's footprint
+  // Fade the map back towards rest, then stamp the pushers' footprints
   const stampTrail = Fn(() => {
     const cell = vec2(
       float(instanceIndex.mod(TRAIL_RES)),
@@ -161,23 +173,27 @@ function createGrass(bladeCount: number) {
     ).toVar();
     const current = trail.xy.mul(recovery(life)).toVar();
 
-    // Capsule from last frame's ball position to this frame's, so fast
-    // movement leaves a continuous trail
-    const segStart = uniforms.previousSpherePosition.xz;
-    const segment = uniforms.spherePosition.xz.sub(segStart);
-    const t = clamp(
-      dot(cellPos.sub(segStart), segment).div(max(dot(segment, segment), 1e-6)),
-      0.0,
-      1.0
-    );
-    const toCell = cellPos.sub(segStart.add(segment.mul(t)));
-    const distance = length(toCell);
-    const strength = smoothstep(
-      0.0,
-      1.0,
-      float(1.0).sub(distance.div(TRAIL_RADIUS))
-    ).mul(1.3);
-    const stamp = toCell.div(max(distance, 0.001)).mul(strength).toVar();
+    // Capsule from each pusher's last frame position to this frame's, so
+    // fast movement leaves a continuous trail; the strongest one counts
+    const stamp = vec2(0.0).toVar();
+    for (const path of uniforms.pushers) {
+      const segStart = path.xy;
+      const segment = path.zw.sub(segStart);
+      const t = clamp(
+        dot(cellPos.sub(segStart), segment).div(max(dot(segment, segment), 1e-6)),
+        0.0,
+        1.0
+      );
+      const toCell = cellPos.sub(segStart.add(segment.mul(t)));
+      const distance = length(toCell);
+      const strength = smoothstep(
+        0.0,
+        1.0,
+        float(1.0).sub(distance.div(TRAIL_RADIUS))
+      ).mul(TRAIL_PUSH);
+      const push = toCell.div(max(distance, 0.001)).mul(strength);
+      stamp.assign(select(dot(push, push).greaterThan(dot(stamp, stamp)), push, stamp));
+    }
 
     // Strongest push wins, so the stamp never weakens an existing trail
     trail.assign(
@@ -217,7 +233,7 @@ function createGrass(bladeCount: number) {
   // Per-frame per-blade data, packed for the vertex shader (3 vec4 per vertex)
   const bladeXform = instancedArray(bladeCount, "vec4"); // posX, posZ, scaled blade x axis
   const bladeBend = instancedArray(bladeCount, "vec4"); // linear bend.xz, cubic droop, height
-  const bladeLook = instancedArray(bladeCount, "vec4"); // restBend.xz, colorVar + dryness, shade
+  const bladeLook = instancedArray(bladeCount, "vec4"); // restBend.xz, colorVar + dryness, shade + blood
 
   // Everything that only depends on the blade (not the vertex) is computed
   // once per blade here, instead of once per vertex in the vertex shader
@@ -304,6 +320,29 @@ function createGrass(bladeCount: number) {
       widthVar.add(thicken.mul(4.0).mul(upright)).mul(select(culled, 0.0, 1.0))
     );
 
+    // Blood: a cone sprayed out from the splat the way the bolt was going,
+    // solid near its start and breaking up towards its ragged far end, with
+    // droplets flung on past it. In units of the stain's radius
+    const blood = float(0.0).toVar();
+    for (const stain of uniforms.stains) {
+      const throwDir = vec2(cos(stain.w), sin(stain.w));
+      const offset = grassPos.sub(stain.xy).div(stain.z);
+      const along = dot(offset, throwDir);
+      const across = abs(dot(offset, vec2(throwDir.y.negate(), throwDir.x)));
+      const rough = noise(grassPos.mul(1.6).add(stain.w.mul(17.0))).sub(0.5);
+      const halfWidth = along.mul(0.42).add(0.35);
+      const inCone = smoothstep(0.12, -0.12, across.sub(halfWidth).add(rough.mul(0.5)))
+        .mul(smoothstep(-0.45, -0.15, along))
+        .mul(smoothstep(4.0, 2.8, along.add(rough.mul(0.8))));
+      // Breaks up into blotches further out
+      const solid = smoothstep(along.mul(0.13).sub(0.1), along.mul(0.13).add(0.05), rough.add(0.25));
+      const patch = inCone.mul(solid);
+      const inFan = smoothstep(0.2, 0.0, across.sub(along.mul(0.5)).sub(0.3));
+      const flung = step(0.0, along).mul(inFan).mul(smoothstep(6.5, 2.5, along));
+      const droplet = step(hash12(cell.add(stain.w.mul(17.0))), flung.mul(0.3));
+      blood.assign(max(blood, max(patch, droplet)));
+    }
+
     // Shadow effect from sphere
     const distanceToSphere = length(grassPos.sub(uniforms.spherePosition.xz));
     const shadowStrength = smoothstep(0.0, 2.0, distanceToSphere).oneMinus().mul(0.8);
@@ -315,8 +354,13 @@ function createGrass(bladeCount: number) {
     bladeLook
       .element(instanceIndex)
       .assign(
-        // Dryness packed into the integer part of the colour variation
-        vec4(restBend, colorVar.mul(0.999).add(floor(bare.mul(15.0))), shadowStrength.oneMinus())
+        // Dryness and blood packed into the integer parts of the colour
+        // variation and the shade
+        vec4(
+          restBend,
+          colorVar.mul(0.999).add(floor(bare.mul(15.0))),
+          shadowStrength.oneMinus().mul(0.999).add(floor(blood.mul(15.0)))
+        )
       );
   })().compute(bladeCount);
 
@@ -352,14 +396,16 @@ function createGrass(bladeCount: number) {
   const color = Fn(() => {
     const colorVar = fract(look.z);
     const dryness = floor(look.z).div(15.0);
-    const shade = look.w;
-    const tint = mix(
+    const shade = fract(look.w);
+    const blood = floor(look.w).div(15.0);
+    const grass = mix(
       vec3(0.12, 0.62, 0.12).add(
         vec3(0.1, 0.3, 0.05).mul(colorVar.sub(0.5).mul(2.0))
       ),
       vec3(0.42, 0.45, 0.14),
       dryness.mul(0.7)
     );
+    const tint = mix(grass, vec3(0.42, 0.015, 0.025), blood.mul(0.92));
 
     const linearModifier = uvY.add(0.1);
     const tipFactor = uvY.sub(0.66).mul(3.0);
@@ -467,16 +513,22 @@ const viewDirection = new THREE.Vector3();
 
 export default function WebGPUGrass({
   spherePosition,
+  pushers,
+  stains,
   look,
   sunPosition,
 }: {
   spherePosition?: THREE.Vector3;
+  // Feet positions that flatten the grass as they move, at most MAX_PUSHERS
+  pushers: Set<THREE.Vector3>;
+  stains: Stains;
   look: GrassLook;
   sunPosition: [number, number, number];
 }) {
   const renderer = useThree((state) => state.gl) as unknown as THREE.WebGPURenderer;
   const size = useThree((state) => state.size);
   const needsClear = useRef(true);
+  const lastPushers = useRef(new Map<THREE.Vector3, THREE.Vector2>());
 
   const {
     Density: density,
@@ -511,7 +563,7 @@ export default function WebGPUGrass({
   const bladeCount = grid.columns * grid.rows;
 
   const geometry = useMemo(() => createBladeGeometry(bladeCount), [bladeCount]);
-  const grass = useMemo(() => createGrass(bladeCount), [bladeCount]);
+  const grass = useMemo(() => createGrass(bladeCount, stains), [bladeCount, stains]);
 
   useEffect(() => () => geometry.dispose(), [geometry]);
   useEffect(() => () => grass.dispose(), [grass]);
@@ -562,10 +614,22 @@ export default function WebGPUGrass({
 
     uniforms.trailFadeStep.value = delta / trailRecovery;
 
-    if (spherePosition) {
-      uniforms.previousSpherePosition.value.copy(uniforms.spherePosition.value);
-      uniforms.spherePosition.value.copy(spherePosition);
+    if (spherePosition) uniforms.spherePosition.value.copy(spherePosition);
+
+    // Each pusher's path since last frame; one that just joined starts
+    // where it is, so a spawn doesn't streak across the field
+    const seen = new Map<THREE.Vector3, THREE.Vector2>();
+    let slot = 0;
+    for (const position of pushers) {
+      if (slot === MAX_PUSHERS) break;
+      const last = lastPushers.current.get(position) ?? new THREE.Vector2(position.x, position.z);
+      uniforms.pushers[slot++].value.set(last.x, last.y, position.x, position.z);
+      seen.set(position, last.set(position.x, position.z));
     }
+    for (; slot < MAX_PUSHERS; slot++) {
+      uniforms.pushers[slot].value.setScalar(NOWHERE);
+    }
+    lastPushers.current = seen;
 
     if (needsClear.current) {
       renderer.compute(grass.clearTrail);
