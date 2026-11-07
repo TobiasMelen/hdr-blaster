@@ -4,21 +4,124 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <title>grass-test</title>
+    <title>HDR Grass Blast</title>
+    <link rel="preload" href="/fonts/tektur-latin.woff2" as="font" type="font/woff2" crossorigin />
     <style>
+      /* Tektur (SIL Open Font License, see public/fonts/OFL.txt), variable
+         in weight and width, split like Google Fonts serves it */
+      @font-face {
+        font-family: "Tektur"; font-weight: 400 900; font-stretch: 75% 100%; font-display: swap;
+        src: url(/fonts/tektur-latin.woff2) format("woff2");
+        unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+      }
+      @font-face {
+        font-family: "Tektur"; font-weight: 400 900; font-stretch: 75% 100%; font-display: swap;
+        src: url(/fonts/tektur-latin-ext.woff2) format("woff2");
+        unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+      }
       body { margin: 0; overflow: hidden; background: #070b16; }
       canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; }
-      /* Covers the view while assets load and shaders compile, then fades out */
-      #loading {
-        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-        background: #070b16; color: #8fa0c8; letter-spacing: 0.2em; text-transform: uppercase;
-        font: 500 14px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-        pointer-events: none; transition: opacity 0.6s ease;
+      :root {
+        --night: #070b16;
+        --ink: #8fa0c8;
+        --ink-bright: #dfe6fa;
+        --line: #2a3352;
       }
+      /* Full-view screens: the landing one, then game over */
+      .screen {
+        position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+        justify-content: center; gap: 28px; padding: 16px; box-sizing: border-box; text-align: center;
+        color: var(--ink); font-family: "Tektur", system-ui, sans-serif;
+        transition: opacity 0.6s ease, background-color 1.2s ease;
+      }
+      .screen h1 {
+        margin: 0; color: var(--ink-bright); font-size: clamp(36px, 9vw, 112px); font-weight: 900;
+        line-height: 0.95; letter-spacing: 0.04em;
+      }
+      .screen p {
+        margin: -12px 0 0; max-width: 44em; font-size: clamp(13px, 1.6vw, 18px); font-weight: 500;
+        line-height: 1.5; letter-spacing: 0.1em; text-transform: uppercase;
+      }
+      .screen button {
+        padding: 14px 48px; border: 1px solid var(--ink); border-radius: 0; background: transparent;
+        color: var(--ink-bright); font: 600 16px/1 "Tektur", system-ui, sans-serif; letter-spacing: 0.3em;
+        text-transform: uppercase; cursor: pointer;
+        transition: opacity 0.4s ease, background-color 0.15s ease, color 0.15s ease;
+      }
+      .screen button:hover, .screen button:focus-visible { background: var(--ink); color: var(--night); outline: none; }
+
+      /* By the game's phase (see main): the landing screen covers the view
+         while loading, turns see-through over the field with a start button
+         on the title, and fades out for play. The score shows from then on,
+         and game over over the greyed field */
+      #landing { background: var(--night); }
+      [data-phase="title"] #landing { background-color: rgb(7 11 22 / 0.55); }
+      body:not([data-phase="loading"], [data-phase="title"]) #landing { opacity: 0; pointer-events: none; }
+      /* The bar and the button share a slot, so the title doesn't move */
+      #landing .slot { display: grid; place-items: center; height: 52px; width: min(320px, 100%); }
+      #landing .slot > * { grid-area: 1 / 1; }
+      #progress { width: 100%; height: 3px; background: var(--line); transition: opacity 0.3s ease; }
+      #progress div {
+        height: 100%; background: var(--ink); transform: scaleX(0); transform-origin: left;
+        transition: transform 0.25s ease;
+      }
+      #start { opacity: 0; visibility: hidden; }
+      [data-phase="title"] #progress { opacity: 0; }
+      [data-phase="title"] #start { opacity: 1; visibility: visible; }
+      [data-phase="loading"] .lil-gui { display: none; }
+
+      #game-over { background: rgb(0 0 0 / 0.35); opacity: 0; pointer-events: none; }
+      [data-phase="over"] #game-over { opacity: 1; pointer-events: auto; }
+      #game-over p { margin: -8px 0 0; color: var(--ink-bright); font-size: clamp(18px, 2.4vw, 26px); }
+
+      #score {
+        position: fixed; left: 16px; bottom: 12px; color: var(--ink-bright); pointer-events: none;
+        font: 600 16px/1 "Tektur", system-ui, sans-serif; letter-spacing: 0.2em; text-transform: uppercase;
+        text-shadow: 0 1px 6px rgb(7 11 22 / 0.8); opacity: 0; transition: opacity 0.6s ease;
+      }
+      body:not([data-phase="loading"], [data-phase="title"]) #score { opacity: 1; }
+      #score span { color: var(--ink); margin-right: 0.6em; font-weight: 500; }
+
+      /* The settings panel, in the landing screen's colours, square. Body
+         first, to win over lil-gui's own, which it adds after this */
+      body .lil-gui {
+        --font-family: "Tektur", system-ui, sans-serif;
+        --background-color: rgb(7 11 22 / 0.92);
+        --text-color: var(--ink);
+        --title-background-color: var(--night);
+        --title-text-color: var(--ink-bright);
+        --widget-color: #141b31;
+        --hover-color: #1d2644;
+        --focus-color: #263157;
+        --number-color: var(--ink-bright);
+        --string-color: var(--ink-bright);
+        --widget-border-radius: 0;
+        --font-size: 12px;
+        --input-font-size: 12px;
+        --widget-height: 22px;
+        --spacing: 5px;
+        --padding: 6px;
+      }
+      body .lil-gui.root { border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+      body .lil-gui .title { text-transform: uppercase; letter-spacing: 0.15em; font-weight: 600; }
+      body .lil-gui.root > .title { border-bottom: 1px solid var(--line); }
     </style>
   </head>
-  <body>
-    <div id="loading">Loading…</div>
+  <body data-phase="loading">
+    <div id="landing" class="screen">
+      <h1>HDR GRASS BLAST</h1>
+      <p>A game about trying out grass blade and HDR rendering<br />WASD to move, mouse to blast</p>
+      <div class="slot">
+        <div id="progress" role="progressbar" aria-label="Loading"><div></div></div>
+        <button id="start" type="button">Start</button>
+      </div>
+    </div>
+    <div id="score"><span>Blasted</span><b id="score-value">0</b></div>
+    <div id="game-over" class="screen">
+      <h1>GAME OVER</h1>
+      <p id="final-score"></p>
+      <button id="respawn" type="button">Respawn</button>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

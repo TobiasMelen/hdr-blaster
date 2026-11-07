@@ -2,7 +2,7 @@ import * as THREE from "three/webgpu";
 import { color, Fn, If, max, mix, normalMap, positionWorld, smoothstep, texture, uniform, vec2, vec3 } from "three/tsl";
 import { noise } from "./tslNoise";
 import { raindrops } from "./rain";
-import { bareGround, pathInset } from "./worldMap";
+import { paths } from "./worldMap";
 
 // Brown Mud 03 by Rob Tuytel, Poly Haven (CC0). Scanned at 1.3 m, drawn
 // larger so the cracks read at iso distance
@@ -39,7 +39,8 @@ export async function createGround() {
   // World xz mapped to follow the plane's own uv axes (v runs along -z),
   // so the normal map's tangent frame lines up
   const gravelUv = vec2(xz.x, xz.y.negate()).div(GRAVEL_TILE);
-  const bare = bareGround(xz);
+  const path = paths(xz).toVar();
+  const bare = path.x;
 
   const arm = texture(gravelArm, gravelUv);
   const occlusion = mix(1.0, arm.r, bare);
@@ -52,7 +53,7 @@ export async function createGround() {
 
   // Puddles in the middle of paths, ringed by darker wet dirt
   const puddleNoise = noise(xz.mul(0.45).add(vec2(-31.0, 8.0)));
-  const deepEnough = smoothstep(0.35, 0.6, pathInset(xz));
+  const deepEnough = smoothstep(0.35, 0.6, path.y);
   const puddle = smoothstep(0.65, 0.7, puddleNoise).mul(deepEnough);
   const wet = smoothstep(0.56, 0.68, puddleNoise).mul(deepEnough);
 
@@ -62,7 +63,7 @@ export async function createGround() {
     .mul(spots)
     .mul(mix(1.0, 0.55, wet));
   // Fake shadow from the grass: the path darkens towards its edges
-  const grassShadow = mix(0.2, 1.0, pathInset(xz));
+  const grassShadow = mix(0.2, 1.0, path.y);
   // Occlusion also goes into the colour at half strength, since ambient
   // light alone (the only light aoNode affects) is too weak to make the
   // cracks read. Puddles are black smooth metal, so only sun glints and

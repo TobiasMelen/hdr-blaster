@@ -3,6 +3,7 @@ import {
   acesFilmicToneMapping,
   agxToneMapping,
   cineonToneMapping,
+  dot,
   float,
   linearToneMapping,
   luminance,
@@ -34,7 +35,10 @@ import { bloom } from "three/examples/jsm/tsl/display/BloomNode.js";
 // their red glow. hdrBoost is a setting, changed live. The glow also
 // counts GLOW_PER_BOOST times hdrBoost over there, so its brighter
 // fall-off rises past white with the cores, while the rest of the scene
-// stays as it is
+// stays as it is.
+// On a Display P3 canvas the scene is taken into P3, so it looks the same,
+// except for what blooms: its colours are read as P3 ones as they are, so
+// the bolts' red and their orange cores go deeper than sRGB can show
 export const TONE_MAPPINGS = {
   "ACES Filmic": acesFilmicToneMapping,
   AgX: agxToneMapping,
@@ -48,7 +52,15 @@ const HIGHLIGHT_KEEP = 0.6;
 const HDR_HIGHLIGHT_KEEP = 1.0;
 const GLOW_PER_BOOST = 0.15;
 export const hdrBoost = uniform(8.0);
+// 0 in colour to 1 black and white, of the finished image (game over)
+export const greyscale = uniform(0.0);
 const HDR_CORE = [1.0, 0.4, 0.12] as const;
+// Linear sRGB to linear Display P3, by rows
+const SRGB_TO_P3 = [
+  [0.8224621, 0.177538, 0.0],
+  [0.0331941, 0.9668058, 0.0],
+  [0.0170827, 0.0723974, 0.9105199],
+] as const;
 // Glow strength and spread (0 to 1), more of both on an HDR canvas, which
 // has room above white
 const BLOOM = 2.0;
@@ -72,6 +84,8 @@ export function createPost(
   msaa: boolean,
   // The canvas takes values past white (see main)
   hdrOutput: boolean,
+  // The canvas shows Display P3 (see main)
+  p3Output: boolean,
   // A TONE_MAPPINGS name, ACES Filmic if unknown
   toneMapping: string
 ) {
@@ -90,7 +104,9 @@ export function createPost(
   // makes every blur step about 4x cheaper
   glow.setResolutionScale(0.25);
   // Grade everything but the bolts, so they stay pure red
-  const base = color.rgb;
+  const rgb = color.rgb;
+  const [r, g, b] = SRGB_TO_P3.map((row) => dot(rgb, vec3(...row)));
+  const base = p3Output ? mix(vec3(r, g, b), rgb, mask) : rgb;
   const blue = vec3(luminance(base)).mul(vec3(...TINT));
   const toned = mix(blue, base, SATURATION);
   const contrasted = pow(max(toned, 0.0).div(CONTRAST_PIVOT), vec3(CONTRAST))
@@ -104,10 +120,12 @@ export function createPost(
     hdrOutput ? over.mul(HDR_HIGHLIGHT_KEEP).add(whiteHot.mul(hdrBoost)) : over.mul(HIGHLIGHT_KEEP)
   );
 
+  const final = filmic.add(highlights);
+
   const pipeline = new THREE.RenderPipeline(renderer);
   pipeline.outputColorTransform = false;
   pipeline.outputNode = renderOutput(
-    vec4(sRGBTransferOETF(filmic.add(highlights)), 1.0),
+    vec4(sRGBTransferOETF(mix(final, vec3(luminance(final)), greyscale)), 1.0),
     THREE.NoToneMapping,
     THREE.LinearSRGBColorSpace
   );

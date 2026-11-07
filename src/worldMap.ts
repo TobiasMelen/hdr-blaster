@@ -1,153 +1,118 @@
 import * as THREE from "three/webgpu";
-import { Fn, smoothstep, texture } from "three/tsl";
-import { noise } from "./tslNoise";
+import {
+  Fn,
+  If,
+  Loop,
+  clamp,
+  dot,
+  float,
+  floor,
+  fract,
+  instanceIndex,
+  mix,
+  normalize,
+  select,
+  smoothstep,
+  texture,
+  textureStore,
+  uniform,
+  uvec2,
+  vec2,
+  vec4,
+} from "three/tsl";
+import { hash12, hash22, noise } from "./tslNoise";
 
-// The world map: authored layout data (paths, and positions of things placed
-// in the world) baked into a texture the shaders sample. Centred on the
-// origin; outside it the world is plain grass
+// The paths: an endless network worked out from the world position. One
+// random point per ROAD_CELL square; the borders between the areas nearest
+// each point are the paths, meeting at junctions. The world is warped
+// first so they wind, and each stretch between two points gets its own
+// width, or none (a gap). Worked out by a compute pass into a map of
+// MAP_SIZE around the player, which the grass and the ground read, and
+// again only once the player strays RECENTRE from its middle
 
-export const WORLD_SIZE = 512; // metres per side
-const MAP_RES = 1024; // texels per side
-
-type Point = [number, number]; // world x, z
-
-export type MapPath = { width: number; points: Point[] };
-
-// Something placed in the world, for whatever gets added next
-export type MapFeature = { kind: string; position: Point };
-
-export const PATHS: MapPath[] = [
-  // Main path winding east-west past the start
-  {
-    width: 3,
-    points: [
-      [-250, -30],
-      [-150, 10],
-      [-60, -15],
-      [0, 6],
-      [50, 25],
-      [120, -5],
-      [250, 20],
-    ],
-  },
-  // Branch from the north joining the main path
-  {
-    width: 2.4,
-    points: [
-      [30, 250],
-      [10, 140],
-      [-5, 60],
-      [0, 6],
-    ],
-  },
-  // Loop south of the main path
-  {
-    width: 2,
-    points: [
-      [-60, -15],
-      [-80, -80],
-      [-20, -140],
-      [60, -120],
-      [120, -5],
-    ],
-  },
-];
-
-export const FEATURES: MapFeature[] = [];
-
-// Points along a Catmull-Rom curve through the path's points, ~1 m apart
-function smoothPath(points: Point[]): Point[] {
-  const curve = new THREE.CatmullRomCurve3(
-    points.map(([x, z]) => new THREE.Vector3(x, 0, z))
-  );
-  return curve
-    .getSpacedPoints(Math.ceil(curve.getLength()))
-    .map((p) => [p.x, p.z]);
-}
-
-// Dirt coverage per texel in the red channel, and in green how far inside a
-// path the texel is (0 at the grass edge, 1 from INSET_DEPTH in); blue and
-// alpha are free for more layers
+const ROAD_CELL = 70; // metres
+const WARP = 14; // metres the world is pushed around by, so paths wind
+const WARP_SCALE = 1 / 60; // per metre, how quickly that changes
+const WIDTH: [number, number] = [2.6, 4]; // metres, random between
+const GAP_CHANCE = 0.2;
+// Soft edge either side of the border (metres), and how far in a path's
+// middle starts (0 at the grass edge, 1 from INSET_DEPTH in)
+const SOFT = 0.75;
 const INSET_DEPTH = 1.8;
+const MAP_SIZE = 128; // metres per side, enough for the view and RECENTRE
+const MAP_RES = 512; // texels per side
+const RECENTRE = 16; // metres
 
-function bakeMap(): Uint8Array {
-  const data = new Uint8Array(MAP_RES * MAP_RES * 4);
-  const texel = WORLD_SIZE / MAP_RES;
-  const toTexel = (v: number) => (v + WORLD_SIZE / 2) / texel - 0.5;
+// Distance (metres) from a world xz position to the nearest path's middle,
+// in x, and that path's half width in y. One pass over the 3x3 cells
+// around it finds the two nearest points; the path is the border between
+// them. Points keep within their cells' middle 80%, so 3x3 is enough
+const nearestPath = Fn(([xz]: [THREE.Node<"vec2">]) => {
+  const warp = vec2(noise(xz.mul(WARP_SCALE)), noise(xz.mul(WARP_SCALE).add(41.3))).sub(0.5).mul(WARP * 2);
+  const p = xz.add(warp).div(ROAD_CELL);
+  const cell = floor(p);
+  const local = fract(p);
 
-  for (const path of PATHS) {
-    const half = path.width / 2;
-    const soft = 0.75;
-    const reach = half + soft;
-    const points = smoothPath(path.points);
+  // Offset to each point, its cell's, and its squared distance
+  const first = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+  const second = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+  const firstSq = float(8.0).toVar();
+  const secondSq = float(8.0).toVar();
+  Loop({ start: -1, end: 2, name: "y" }, ({ y }) => {
+    Loop({ start: -1, end: 2, name: "x" }, ({ x }) => {
+      const offset = vec2(float(x), float(y));
+      const toPoint = offset.add(hash22(cell.add(offset)).mul(0.8).add(0.1)).sub(local);
+      const distanceSq = dot(toPoint, toPoint);
+      If(distanceSq.lessThan(firstSq), () => {
+        second.assign(first);
+        secondSq.assign(firstSq);
+        first.assign(vec4(toPoint, offset));
+        firstSq.assign(distanceSq);
+      }).ElseIf(distanceSq.lessThan(secondSq), () => {
+        second.assign(vec4(toPoint, offset));
+        secondSq.assign(distanceSq);
+      });
+    });
+  });
 
-    for (let i = 0; i < points.length - 1; i++) {
-      const [ax, az] = points[i];
-      const [bx, bz] = points[i + 1];
-      const abx = bx - ax;
-      const abz = bz - az;
-      const abLengthSq = Math.max(abx * abx + abz * abz, 1e-6);
-
-      const x0 = Math.max(0, Math.floor(toTexel(Math.min(ax, bx) - reach)));
-      const x1 = Math.min(MAP_RES - 1, Math.ceil(toTexel(Math.max(ax, bx) + reach)));
-      const z0 = Math.max(0, Math.floor(toTexel(Math.min(az, bz) - reach)));
-      const z1 = Math.min(MAP_RES - 1, Math.ceil(toTexel(Math.max(az, bz) + reach)));
-
-      for (let tz = z0; tz <= z1; tz++) {
-        const z = (tz + 0.5) * texel - WORLD_SIZE / 2;
-        for (let tx = x0; tx <= x1; tx++) {
-          const x = (tx + 0.5) * texel - WORLD_SIZE / 2;
-          const t = THREE.MathUtils.clamp(
-            ((x - ax) * abx + (z - az) * abz) / abLengthSq,
-            0,
-            1
-          );
-          const distance = Math.hypot(x - ax - abx * t, z - az - abz * t);
-          const coverage =
-            1 - THREE.MathUtils.smoothstep(distance, half - soft, reach);
-          const inset = THREE.MathUtils.clamp((half - distance) / INSET_DEPTH, 0, 1);
-          const index = (tz * MAP_RES + tx) * 4;
-          data[index] = Math.max(data[index], Math.round(coverage * 255));
-          data[index + 1] = Math.max(data[index + 1], Math.round(inset * 255));
-        }
-      }
-    }
-  }
-  return data;
-}
-
-const mapData = bakeMap();
-
-export const worldMapTexture = new THREE.DataTexture(
-  mapData,
-  MAP_RES,
-  MAP_RES,
-  THREE.RGBAFormat
-);
-worldMapTexture.magFilter = THREE.LinearFilter;
-worldMapTexture.minFilter = THREE.LinearFilter;
-worldMapTexture.needsUpdate = true;
-
-// Dirt coverage (0-1) at a world xz position, for game logic
-export function dirtAt(x: number, z: number): number {
-  const tx = Math.floor((x + WORLD_SIZE / 2) / (WORLD_SIZE / MAP_RES));
-  const tz = Math.floor((z + WORLD_SIZE / 2) / (WORLD_SIZE / MAP_RES));
-  if (tx < 0 || tz < 0 || tx >= MAP_RES || tz >= MAP_RES) return 0;
-  return mapData[(tz * MAP_RES + tx) * 4] / 255;
-}
-
-// How bare the ground is at a world xz position: the baked path coverage
-// with a noisy edge, shared by the grass and the ground so they line up
-const pathEdgeNoise = (xz: THREE.Node<"vec2">) => noise(xz.mul(0.9)).sub(0.5);
-
-export const bareGround = Fn(([xz]: [THREE.Node<"vec2">]) => {
-  const coverage = texture(worldMapTexture, xz.div(WORLD_SIZE).add(0.5)).level(0).r;
-  return smoothstep(0.3, 0.7, coverage.add(pathEdgeNoise(xz).mul(0.5)));
+  const border = dot(first.xy.add(second.xy).mul(0.5), normalize(second.xy.sub(first.xy)));
+  // The same for both cells of the stretch, whichever is nearer. A gap's
+  // width is below zero, so even its soft edge misses
+  const stretch = hash12(cell.mul(2.0).add(first.zw).add(second.zw).add(0.5));
+  const half = select(stretch.lessThan(GAP_CHANCE), -2 * SOFT, mix(WIDTH[0] / 2, WIDTH[1] / 2, fract(stretch.mul(7.0))));
+  return vec2(border.mul(ROAD_CELL), half);
 });
 
-// How far inside a path a position is (0 at the grass edge, 1 well inside),
-// with the same noisy edge as bareGround
-export const pathInset = Fn(([xz]: [THREE.Node<"vec2">]) => {
-  const inset = texture(worldMapTexture, xz.div(WORLD_SIZE).add(0.5)).level(0).g;
-  return smoothstep(0.0, 1.0, inset.add(pathEdgeNoise(xz).mul(0.4)));
+// Coverage (0 to 1, how much of a texel is path) in red, and how far
+// inside a path in green
+const map = new THREE.StorageTexture(MAP_RES, MAP_RES);
+map.minFilter = map.magFilter = THREE.LinearFilter;
+const centre = uniform(new THREE.Vector2(Infinity, Infinity));
+const fill = Fn(() => {
+  const texel = uvec2(instanceIndex.mod(MAP_RES), instanceIndex.div(MAP_RES));
+  const xz = vec2(texel).add(0.5).mul(MAP_SIZE / MAP_RES).sub(MAP_SIZE / 2).add(centre);
+  const path = nearestPath(xz);
+  const coverage = smoothstep(path.y.sub(SOFT), path.y.add(SOFT), path.x).oneMinus();
+  const inset = clamp(path.y.sub(path.x).div(INSET_DEPTH), 0.0, 1.0);
+  textureStore(map, texel, vec4(coverage, inset, 0.0, 1.0));
+})().compute(MAP_RES * MAP_RES);
+
+// Redraws the map around a position once it's strayed far enough, on a
+// whole texel so the paths don't shift
+export function updatePaths(renderer: THREE.WebGPURenderer, position: THREE.Vector3) {
+  if (Math.hypot(position.x - centre.value.x, position.z - centre.value.y) < RECENTRE) return;
+  const texel = MAP_SIZE / MAP_RES;
+  centre.value.set(Math.round(position.x / texel) * texel, Math.round(position.z / texel) * texel);
+  renderer.compute(fill);
+}
+
+const pathEdgeNoise = (xz: THREE.Node<"vec2">) => noise(xz.mul(0.9)).sub(0.5);
+
+// At a world xz position: how bare the ground is in x, and how far inside
+// a path in y (0 at the grass edge, 1 well inside). Both with a noisy edge,
+// shared by the grass and the ground so they line up
+export const paths = Fn(([xz]: [THREE.Node<"vec2">]) => {
+  const path = texture(map, xz.sub(centre).div(MAP_SIZE).add(0.5)).level(0);
+  const edge = pathEdgeNoise(xz);
+  return vec2(smoothstep(0.3, 0.7, path.r.add(edge.mul(0.5))), smoothstep(0.0, 1.0, path.g.add(edge.mul(0.4))));
 });

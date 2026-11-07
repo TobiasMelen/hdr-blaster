@@ -389,6 +389,14 @@ export class BoltPool {
     return null;
   }
 
+  // Every bolt gone, flying or bursting. Debris settles on its own
+  clear() {
+    for (const bolt of this.bolts) {
+      bolt.burst = -1;
+      this.end(bolt);
+    }
+  }
+
   private end(bolt: Bolt) {
     bolt.age = BOLT_LIFE;
     bolt.mesh.visible = false;

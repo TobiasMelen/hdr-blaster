@@ -21,9 +21,9 @@ const APPROACH_SPEED = 3.2; // metres per second
 const STRAFE_SPEED = 1.6;
 const ACCELERATION = 4; // how quickly velocity reaches the intent, per second
 const ATTACK_RANGE = 12; // holds about this far from the player
-const FIRE_RANGE = 16; // starts shooting from this close
+const FIRE_RANGE = 26; // starts shooting from this close, on the way in
 const FIRE_INTERVAL: [number, number] = [0.9, 1.6]; // seconds, random between
-const AIM_ERROR = 0.07; // radians either side
+const AIM_ERROR = 0.15; // radians either side
 const PERSONAL_SPACE = 2.2; // metres kept between enemies
 
 const HIT_RADIUS = 0.6;
@@ -51,7 +51,9 @@ export function createEnemies(
   bolts: BoltPool,
   grassPushers: Set<THREE.Vector3>,
   stains: Stains,
-  player: THREE.Vector3
+  player: THREE.Vector3,
+  // Each enemy blown apart
+  onKill: () => void
 ) {
   // A fixed pool, built up front so arrivals don't stall a frame
   const group = new THREE.Group();
@@ -77,6 +79,7 @@ export function createEnemies(
         hit: (direction) => {
           stains.add(bot.position.x, bot.position.z, direction);
           leave(enemy);
+          onKill();
         },
       },
       active: false,
@@ -162,5 +165,11 @@ export function createEnemies(
     }
   }
 
-  return { object: group, update };
+  // All gone, the next arriving shortly after update resumes
+  function clear() {
+    for (const enemy of enemies) if (enemy.active) leave(enemy);
+    spawnTimer = 1;
+  }
+
+  return { object: group, update, clear };
 }

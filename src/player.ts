@@ -1,10 +1,12 @@
 import * as THREE from "three/webgpu";
 import { ISO_RIGHT, ISO_UP } from "./iso";
 import { Bot, type BotAssets } from "./bot";
-import type { BoltPool } from "./bolts";
+import type { BoltPool, Target } from "./bolts";
+import type { Stains } from "./stains";
 
 // The player's bot: WASD moves it along the screen's axes, it always aims
-// at the mouse, and fires bolts towards it while the button is held
+// at the mouse, and fires bolts towards it while the button is held. One
+// enemy bolt blows it apart, like the enemies, until revived
 
 const MAX_SPEED = 4.5; // metres per second
 const ACCELERATION = 8; // how quickly velocity reaches the input, per second
@@ -26,7 +28,7 @@ const aimPoint = new THREE.Vector3();
 const boltDirection = new THREE.Vector3();
 const move = new THREE.Vector3();
 
-export function createPlayer(assets: BotAssets, bolts: BoltPool, canvas: HTMLCanvasElement) {
+export function createPlayer(assets: BotAssets, bolts: BoltPool, canvas: HTMLCanvasElement, stains: Stains) {
   const bot = new Bot(assets, "silver");
   // Where it looks, shared with the camera, which leads that way
   const aim = new THREE.Vector3(0, 0, 1);
@@ -37,9 +39,30 @@ export function createPlayer(assets: BotAssets, bolts: BoltPool, canvas: HTMLCan
   const pointer = new THREE.Vector2();
   let firing = false;
   let cooldown = 0;
+  let alive = true;
 
-  // Enemy bolts stop on the player; there's no damage yet
-  bolts.targets.add({ team: "player", position: bot.position, radius: HIT_RADIUS, explodes: false, hit: () => {} });
+  const target: Target = {
+    team: "player",
+    position: bot.position,
+    radius: HIT_RADIUS,
+    explodes: true,
+    hit: (direction) => {
+      stains.add(bot.position.x, bot.position.z, direction);
+      bot.object.visible = false;
+      bolts.targets.delete(target);
+      alive = false;
+    },
+  };
+  bolts.targets.add(target);
+
+  // Back where it fell, standing still
+  function revive() {
+    bot.velocity.set(0, 0, 0);
+    bot.object.visible = true;
+    firing = false;
+    bolts.targets.add(target);
+    alive = true;
+  }
 
   window.addEventListener("keydown", (event) => keys.add(event.code));
   window.addEventListener("keyup", (event) => keys.delete(event.code));
@@ -58,6 +81,7 @@ export function createPlayer(assets: BotAssets, bolts: BoltPool, canvas: HTMLCan
   window.addEventListener("pointerup", () => (firing = false));
 
   function update(delta: number, camera: THREE.Camera) {
+    if (!alive) return;
     // Aim on the plane at muzzle height, so bolts fly level through the
     // point under the mouse
     const muzzle = bot.muzzle;
@@ -97,5 +121,14 @@ export function createPlayer(assets: BotAssets, bolts: BoltPool, canvas: HTMLCan
     heroLight.position.copy(bot.position).add(HERO_LIGHT_OFFSET);
   }
 
-  return { object, position: bot.position, aim, update };
+  return {
+    object,
+    position: bot.position,
+    aim,
+    update,
+    revive,
+    get alive() {
+      return alive;
+    },
+  };
 }

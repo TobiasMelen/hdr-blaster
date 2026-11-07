@@ -7,12 +7,13 @@ import { grassField, grassSettings, type GrassLook } from "./grass";
 import { createGround } from "./ground";
 import { createPlayer } from "./player";
 import { createEnemies } from "./enemies";
-import { createPost, hdrBoost, TONE_MAPPINGS } from "./post";
+import { createPost, greyscale, hdrBoost, TONE_MAPPINGS } from "./post";
 import { loadBotAssets } from "./bot";
 import { BoltPool } from "./bolts";
 import { Stains } from "./stains";
 import { ClusteredLighting } from "./lighting/ClusteredLighting";
 import { ISO_OFFSET, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { updatePaths } from "./worldMap";
 
 type ScenePreset = {
   background: string;
@@ -52,18 +53,27 @@ const LOOK_AHEAD_VERTICAL = 2.2;
 const LOOK_AHEAD_RATE = 1.8; // per second
 const FOLLOW_RATE = 4; // per second
 
+// Blown apart, the world slows to SLOW_MOTION and drains to black and
+// white over DEATH_EASE seconds, and the game over screen shows after
+// GAME_OVER_DELAY (seconds of real time)
+const SLOW_MOTION = 0.2;
+const DEATH_EASE = 0.8;
+const GAME_OVER_DELAY = 1.4;
+
 // Dev settings. On a 2x display, 1.5x resolution and no multisampling each
 // take a large share of the GPU work. A 60 fps cap on a 120 Hz display
 // halves the GPU's work; 0 runs at the display's rate. HDR output costs
 // about a third of the frame, and is off for good on screens that can't
-// show it. Kept in localStorage, with the grass's
+// show it, as is Display P3. Kept in localStorage, with the grass's
 const hdrScreen = matchMedia("(dynamic-range: high)").matches;
+const p3Screen = matchMedia("(color-gamut: p3)").matches;
 const settings = {
   scene: "Moon",
   resolution: 2,
   msaa: true,
   fps: 60,
   hdr: hdrScreen,
+  p3: p3Screen,
   hdrBoost: hdrBoost.value,
   toneMapping: "ACES Filmic",
 };
@@ -76,6 +86,7 @@ try {
   // Nothing saved, or storage blocked: defaults
 }
 settings.hdr &&= hdrScreen;
+settings.p3 &&= p3Screen;
 hdrBoost.value = settings.hdrBoost;
 const save = () => {
   try {
@@ -88,6 +99,12 @@ const save = () => {
 function outputType() {
   return settings.hdr ? THREE.HalfFloatType : THREE.UnsignedByteType;
 }
+
+// The landing screen: its bar fills as assets load (most of it) and the
+// shaders compile (the rest), then a start button takes its place
+const bar = document.querySelector<HTMLElement>("#progress > div")!;
+const progress = (fraction: number) => (bar.style.transform = `scaleX(${fraction})`);
+THREE.DefaultLoadingManager.onProgress = (_url, loaded, total) => progress(0.1 + (0.6 * loaded) / total);
 
 // three's WebGPURenderer, minus its WebGL fallback: the grass needs
 // compute shaders, which WebGL lacks
@@ -105,8 +122,15 @@ const renderer = new Renderer(new WebGPUBackend(rendererOptions), rendererOption
 renderer.library = new StandardNodeLibrary();
 // Point lights (the laser bolts) only shade the pixels they reach
 renderer.lighting = new ClusteredLighting();
+// three sets the canvas up without a colour space, so sRGB: this adds
+// ours each time it does
+const gpuContext = renderer.domElement.getContext("webgpu")!;
+const configure = gpuContext.configure.bind(gpuContext);
+gpuContext.configure = (config) =>
+  configure({ ...config, colorSpace: settings.p3 ? "display-p3" : "srgb" });
 await renderer.init();
 document.body.prepend(renderer.domElement);
+progress(0.1);
 
 const scene = new THREE.Scene();
 const camera = new THREE.OrthographicCamera();
@@ -124,20 +148,26 @@ scene.add(ambient, sun, moon);
 const stains = new Stains();
 const bolts = new BoltPool(stains);
 const [ground, botAssets] = await Promise.all([createGround(), loadBotAssets()]);
-const player = createPlayer(botAssets, bolts, renderer.domElement);
+const player = createPlayer(botAssets, bolts, renderer.domElement, stains);
+const home = player.position.clone();
 // Everything that flattens the grass: the player, and enemies while around
 const grassPushers = new Set([player.position]);
-const enemies = createEnemies(botAssets, bolts, grassPushers, stains, player.position);
+// Kills this life, shown bottom left and on the game over screen
+let score = 0;
+const setScore = (value: number) => (document.getElementById("score-value")!.textContent = String((score = value)));
+const enemies = createEnemies(botAssets, bolts, grassPushers, stains, player.position, () => setScore(score + 1));
 const grass = grassField(renderer, stains, grassPushers, player.position);
 scene.add(ground.mesh, grass.mesh, player.object, enemies.object, bolts.group);
-const makePost = () => createPost(renderer, scene, camera, settings.msaa, settings.hdr, settings.toneMapping);
+progress(0.75);
+const makePost = () => createPost(renderer, scene, camera, settings.msaa, settings.hdr, settings.p3, settings.toneMapping);
 let post = makePost();
 function rebuildPost() {
   post.dispose();
   post = makePost();
 }
 
-// Switches between HDR and plain output. three sets up a canvas once per
+// Switches between HDR and plain output, and between Display P3 and sRGB.
+// three sets up a canvas once per
 // canvas target, reading the backend's output type, so this changes that
 // and hands the same canvas over in a new target. Only the last pass draws
 // to the canvas, so it's the only one rebuilt
@@ -148,7 +178,7 @@ function setOutput() {
   old.dispose();
   sizeCanvas();
   rebuildPost();
-  boostControl.disable(!settings.hdr);
+    boostControl.disable(!settings.hdr);
 }
 
 function applyScene() {
@@ -189,7 +219,8 @@ applyScene();
 resize();
 window.addEventListener("resize", resize);
 
-// Bottom right, closed until opened. The game pauses while it's open
+// Bottom right, closed until opened, and hidden while loading. The game
+// pauses while it's open
 const gui = new GUI({ title: "Settings" }).onChange(save).close();
 let paused = false;
 gui.$title.addEventListener("click", () => (paused = !gui._closed));
@@ -201,6 +232,7 @@ graphicsGui.add(settings, "msaa").name("MSAA 4x").onChange(rebuildPost);
 graphicsGui.add(settings, "fps", { "60": 60, Display: 0 }).name("Frame rate cap");
 graphicsGui.add(settings, "toneMapping", Object.keys(TONE_MAPPINGS)).name("Tone Mapping").onChange(rebuildPost);
 graphicsGui.add(settings, "hdr").name("HDR").disable(!hdrScreen).onChange(setOutput);
+graphicsGui.add(settings, "p3").name("Display P3").disable(!p3Screen).onChange(setOutput);
 // How bright the bolts' cores, and their glow, burn past white, on HDR only
 const boostControl = graphicsGui
   .add(settings, "hdrBoost", 0, 16, 0.5)
@@ -215,9 +247,26 @@ grassGui.add(grassSettings, "trailRecovery", 0.2, 20, 0.1).name("Trail Recovery"
 grassGui.add(grassSettings, "ridge", 0, 1, 0.05).name("Blade Ridge");
 grassGui.add(grassSettings, "bladeLit").name("Blade Lighting").onChange(resize);
 
-// Until every shader has compiled, the loading screen covers the view and
-// enemies hold off
-let ready = false;
+// Where the game is: loading, the title screen, waiting for the player's
+// first move (enemies held off), playing, dying (slowing and draining to
+// grey) and over, then back to waiting, which revives the player where it
+// fell. On <body> too, which shows the screens
+type Phase = "loading" | "title" | "waiting" | "playing" | "dying" | "over";
+let phase: Phase = "loading";
+let phaseTime = 0; // real seconds
+function setPhase(next: Phase) {
+  phase = next;
+  phaseTime = 0;
+  document.body.dataset.phase = next;
+  if (next === "dying") enemies.clear();
+  if (next === "over") document.getElementById("final-score")!.textContent = `Blasted ${score}`;
+  if (next !== "waiting") return;
+  bolts.clear();
+  enemies.clear();
+  player.revive();
+  home.copy(player.position);
+  setScore(0);
+}
 let elapsed = 0;
 const focus = new THREE.Vector3();
 const lead = new THREE.Vector3();
@@ -227,12 +276,19 @@ const view = new THREE.Vector3();
 // Paused, everything holds still but still gets drawn, so settings changes
 // show
 function frame(delta: number) {
-  if (paused) delta = 0;
-  else {
+  if (paused || phase === "loading" || phase === "title") delta = 0;
+  phaseTime += delta;
+  if (phase === "dying" && phaseTime >= GAME_OVER_DELAY) setPhase("over");
+  const fade = phase === "over" ? 1 : phase === "dying" ? THREE.MathUtils.smoothstep(phaseTime, 0, DEATH_EASE) : 0;
+  greyscale.value = fade;
+  delta *= THREE.MathUtils.lerp(1, SLOW_MOTION, fade);
+  if (delta > 0) {
     elapsed += delta;
     player.update(delta, camera);
-    if (ready) enemies.update(delta);
+    if (phase === "waiting" && player.position.distanceToSquared(home) > 0.01) setPhase("playing");
+    if (phase === "playing") enemies.update(delta);
     bolts.update(delta);
+    if (phase === "playing" && !player.alive) setPhase("dying");
   }
 
   // Glide after the character, leading towards the mouse
@@ -249,6 +305,7 @@ function frame(delta: number) {
 
   ground.mesh.position.set(player.position.x, -0.01, player.position.z);
   ground.time.value = elapsed;
+  updatePaths(renderer, player.position);
   const preset = SCENES[settings.scene];
   grass.update(delta, elapsed, scene, camera, preset.grass, preset.light.position);
   post.render();
@@ -274,17 +331,28 @@ scene.traverse((object) => {
   if (!object.visible) hidden.push(object);
 });
 for (const object of hidden) object.visible = true;
-for (let i = 0; i < 3; i++) await new Promise(requestAnimationFrame);
+for (let i = 0; i < 3; i++) {
+  await new Promise(requestAnimationFrame);
+  progress(0.8 + (0.15 * (i + 1)) / 3);
+}
 await device.queue.onSubmittedWorkDone();
+progress(1);
 for (const object of hidden) object.visible = false;
-ready = true;
-document.getElementById("loading")!.style.opacity = "0";
+setPhase("title");
+// Start and Respawn, or Enter while either shows
+for (const id of ["start", "respawn"]) document.getElementById(id)!.addEventListener("click", () => setPhase("waiting"));
+addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (phase === "title" || phase === "over")) setPhase("waiting");
+});
 
 // ?bench: window.__burn(frames) renders frames back to back, with no wait
 // for the display, at a fixed 60 fps step, keeping two in flight on the GPU
+// It skips the title screen
 if (new URLSearchParams(location.search).has("bench")) {
+  setPhase("waiting");
   Object.assign(window, {
     __scene: scene,
+    __camera: camera,
     __burn: async (frames = 600) => {
       burning = true;
       await device.queue.onSubmittedWorkDone();

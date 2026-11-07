@@ -39,7 +39,7 @@ import {
 } from "three/tsl";
 import { ISO_ELEVATION, ISO_OFFSET, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
-import { bareGround } from "./worldMap";
+import { paths } from "./worldMap";
 import { MAX_DENTS, MAX_STAINS, type Stains } from "./stains";
 
 // Trail map resolution (cells per side), the world size it wraps over (so
@@ -422,26 +422,29 @@ function createGrass(
       const color = uniforms.lightColors.element(i);
       const toLight = light.xyz.sub(position);
       const distance = length(toLight).toVar();
-      const falloff = pow(distance, color.w)
-        .max(0.01)
-        .reciprocal()
-        .mul(pow(saturate(pow(distance.div(light.w), 4.0).oneMinus()), 2.0));
-      const direction = toLight.div(distance).toVar();
-      const irradiance = color.xyz.mul(saturate(dot(n, direction)).mul(falloff)).toVar();
-      sum.addAssign(irradiance);
+      // Out of the light's range it adds nothing: skipped
+      If(distance.lessThan(light.w), () => {
+        const falloff = pow(distance, color.w)
+          .max(0.01)
+          .reciprocal()
+          .mul(pow(saturate(pow(distance.div(light.w), 4.0).oneMinus()), 2.0));
+        const direction = toLight.div(distance).toVar();
+        const irradiance = color.xyz.mul(saturate(dot(n, direction)).mul(falloff)).toVar();
+        sum.addAssign(irradiance);
 
-      const half = direction.add(toCamera).normalize();
-      const dotVH = saturate(dot(toCamera, half));
-      const fresnel = dotVH.mul(-5.55473).sub(6.98316).mul(dotVH).exp2();
-      const highlight = uniforms.shininess
-        .mul(0.5)
-        .add(1.0)
-        .mul(0.25 / Math.PI)
-        .mul(pow(saturate(dot(n, half)), uniforms.shininess))
-        .mul(fresnel.oneMinus());
-      const amount = irradiance.x.add(irradiance.y).add(irradiance.z);
-      highlights.addAssign(highlight.mul(amount));
-      brightness.addAssign(amount);
+        const half = direction.add(toCamera).normalize();
+        const dotVH = saturate(dot(toCamera, half));
+        const fresnel = dotVH.mul(-5.55473).sub(6.98316).mul(dotVH).exp2();
+        const highlight = uniforms.shininess
+          .mul(0.5)
+          .add(1.0)
+          .mul(0.25 / Math.PI)
+          .mul(pow(saturate(dot(n, half)), uniforms.shininess))
+          .mul(fresnel.oneMinus());
+        const amount = irradiance.x.add(irradiance.y).add(irradiance.z);
+        highlights.addAssign(highlight.mul(amount));
+        brightness.addAssign(amount);
+      });
     });
     return vec4(sum, highlights.div(brightness.max(1e-6)));
   });
@@ -464,7 +467,7 @@ function createGrass(
 
     // Paths: blades thin out towards bare ground, the survivors shorter and
     // drier; culled blades collapse to zero size
-    const bare = bareGround(grassPos).toVar();
+    const bare = paths(grassPos).x.toVar();
     const culled = hash12(cell.add(vec2(-63.7, 29.1))).lessThan(bare);
     const pathScale = select(culled, 0.0, bare.mul(-0.6).add(1.0));
 
@@ -749,10 +752,16 @@ const viewDirection = new THREE.Vector3();
 const lightColor = new THREE.Color();
 const lightPosition = new THREE.Vector3();
 const targetPosition = new THREE.Vector3();
+const view = new THREE.Frustum();
+const viewMatrix = new THREE.Matrix4();
+const reach = new THREE.Sphere();
+// How far past the screen's edge a light still matters: blades whose root
+// is off screen can reach into it (metres)
+const OFF_SCREEN_REACH = 3;
 
 // Copies the scene's visible lights into the grass's own: the ambient
 // lights summed, one directional light (the sun or moon) and the first
-// MAX_GRASS_LIGHTS point lights
+// MAX_GRASS_LIGHTS point lights that can reach the screen
 function mirrorLights(
   scene: THREE.Scene,
   camera: THREE.Camera,
@@ -761,6 +770,7 @@ function mirrorLights(
   uniforms.ambient.value.setRGB(0, 0, 0);
   uniforms.sunColor.value.setRGB(0, 0, 0);
   let count = 0;
+  view.setFromProjectionMatrix(viewMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
   scene.traverseVisible((object) => {
     const light = object as THREE.Light;
     if (!light.isLight) return;
@@ -781,6 +791,8 @@ function mirrorLights(
       const point = light as THREE.PointLight;
       point.updateWorldMatrix(true, false);
       lightPosition.setFromMatrixPosition(point.matrixWorld);
+      reach.set(lightPosition, point.distance + OFF_SCREEN_REACH);
+      if (point.distance && !view.intersectsSphere(reach)) return;
       // A range of 0 means endless
       uniforms.lightPositions.array[count].set(
         lightPosition.x,
