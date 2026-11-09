@@ -164,7 +164,7 @@ export function createPost(
     .mul(CONTRAST_PIVOT * EXPOSURE);
   const hdr = mix(contrasted, base, mask).add(glow.rgb);
   const curve = TONE_MAPPINGS[toneMapping as keyof typeof TONE_MAPPINGS] ?? acesFilmicToneMapping;
-  const filmic = curve(hdr, float(1.0));
+  const filmic = curve(hdr, float(1.0)) as THREE.Node<"vec3">;
   const over = max(hdr.add(glow.rgb.mul(boost.mul(GLOW_PER_BOOST))).sub(1.0), 0.0);
   const whiteHot = vec3(max(base.r, max(base.g, base.b))).mul(mask).mul(vec3(...HDR_CORE));
   const highlights = over.mul(look.keep).add(whiteHot.mul(boost));
@@ -174,7 +174,7 @@ export function createPost(
   const pipeline = new THREE.RenderPipeline(renderer);
   pipeline.outputColorTransform = false;
   pipeline.outputNode = renderOutput(
-    vec4(sRGBTransferOETF(mix(final, vec3(luminance(final)), greyscale)), 1.0),
+    vec4(sRGBTransferOETF(mix(final, vec3(luminance(final)), greyscale)) as THREE.Node<"vec3">, 1.0),
     THREE.NoToneMapping,
     THREE.LinearSRGBColorSpace
   );

@@ -15,9 +15,6 @@ export type DebrisStyle = {
   gravity: number; // metres per second squared
   drag: number; // fraction of speed lost per second
   width: number; // metres
-  // Height at which a falling bit reports landing, before it reaches the
-  // ground: the grass tops it falls into
-  landAt?: number;
   // Where bits start: a column around the burst point reaching this far
   // below it, instead of the point itself
   body?: { radius: number; below: number };
@@ -35,7 +32,6 @@ type Bit = {
   age: number;
   life: number;
   size: number;
-  landed: boolean;
 };
 
 const zAxis = new THREE.Vector3(0, 0, 1);
@@ -49,19 +45,15 @@ export class Debris {
   readonly mesh: THREE.InstancedMesh;
   private readonly bits: Bit[] = [];
   private next = 0;
+  private readonly style: DebrisStyle;
 
-  constructor(
-    private readonly style: DebrisStyle,
-    geometry: THREE.BufferGeometry,
-    material: THREE.Material,
-    // Told where each bit hits the ground, and how wide it was
-    private readonly onLand?: (position: THREE.Vector3, width: number) => void
-  ) {
+  constructor(style: DebrisStyle, geometry: THREE.BufferGeometry, material: THREE.Material) {
+    this.style = style;
     this.mesh = new THREE.InstancedMesh(geometry, material, style.pool);
     this.mesh.frustumCulled = false;
     for (let i = 0; i < style.pool; i++) {
       this.mesh.setMatrixAt(i, hidden);
-      this.bits.push({ position: new THREE.Vector3(), velocity: new THREE.Vector3(), age: 1, life: 0, size: 1, landed: true });
+      this.bits.push({ position: new THREE.Vector3(), velocity: new THREE.Vector3(), age: 1, life: 0, size: 1 });
     }
   }
 
@@ -89,7 +81,6 @@ export class Debris {
         .normalize()
         .multiplyScalar(THREE.MathUtils.randFloat(...style.speed));
       bit.age = 0;
-      bit.landed = false;
       bit.life = THREE.MathUtils.randFloat(...style.life);
       bit.size = 1 + THREE.MathUtils.randFloatSpread(2 * (style.variety ?? 0));
     }
@@ -103,10 +94,6 @@ export class Debris {
       if (bit.age >= bit.life) continue;
       bit.age += delta;
       // Gone once spent, or on reaching the ground
-      if (!bit.landed && bit.velocity.y < 0 && bit.position.y < (style.landAt ?? 0)) {
-        bit.landed = true;
-        this.onLand?.(bit.position, style.width * bit.size);
-      }
       if (bit.age >= bit.life || bit.position.y < 0) {
         bit.age = bit.life;
         this.mesh.setMatrixAt(i, hidden);

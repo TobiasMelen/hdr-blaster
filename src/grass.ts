@@ -40,27 +40,30 @@ import {
 import { ISO_ELEVATION, ISO_OFFSET, ISO_RIGHT, ISO_UP } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
 import { paths } from "./worldMap";
-import { MAX_DENTS, MAX_STAINS, type Stains } from "./stains";
+import { MAX_STAINS, type Stains } from "./stains";
 
 // Trail map resolution (cells per side), the world size it wraps over (so
 // it holds trails within half that of the player) and the stamp radius
 const TRAIL_RES = 512;
 const TRAIL_SIZE = 80;
 const TRAIL_TEXEL = TRAIL_SIZE / TRAIL_RES;
-const TRAIL_RADIUS = 1.0;
-// How hard the stamp pushes blades over at its centre
-const TRAIL_PUSH = 0.95;
-// How hard a landing blood blob pushes the blades it hits apart
-const DENT_PUSH = 0.95;
-// Square of trail map cells painted around a dent, enough for the biggest
-const DENT_CELLS = 20;
+// How wide and how hard something moving through the grass pushes it over
+// at its centre, and how many times faster than trailRecovery the grass
+// springs back from it (a whole number): feet (the player's and the
+// enemies'), and others
+export type Push = { radius: number; strength: number; recovery: number };
+export const FOOTSTEP: Push = { radius: 1.0, strength: 0.95, recovery: 1 };
+// How hard blood pushes the blades it lands on, away from the impact: less
+// than a footstep
+const STAIN_PUSH = 0.7;
 // Square of cells painted around a stain, centred this far along its throw:
 // enough for its furthest droplets either way (metres)
 const STAIN_PAINT_SIZE = 22;
 const STAIN_PAINT_AHEAD = 6.5;
 const STAIN_CELLS = Math.ceil(STAIN_PAINT_SIZE / TRAIL_TEXEL);
-// Most things pushing the grass at once (the player and the enemies)
-const MAX_PUSHERS = 6;
+// Most things pushing the grass at once: the player, the enemies and the
+// bolts in flight
+const MAX_PUSHERS = 20;
 // Where unused pusher slots sit, far from any grass
 const NOWHERE = 1e6;
 // Reach of a stain slot with nothing to paint
@@ -69,7 +72,7 @@ const NOT_PAINTING = -1e3;
 const MAX_GRASS_LIGHTS = 16;
 
 // Blades lean past the edges of their footprint by up to this much: wind
-// (~1.4 m at full gust on soft blades), trail push (up to TRAIL_PUSH m) and rest bend
+// (~1.4 m at full gust on soft blades), trail push (up to FOOTSTEP.strength m) and rest bend
 const BEND_MARGIN = 3.0;
 
 // The view's ground axes, and the ground direction towards the camera
@@ -174,6 +177,11 @@ function createMaps() {
 // the point lights once per blade, at its root and tip, in the update
 // compute, and the sun and ambient light per pixel. Only the chosen path
 // is built into the shaders
+// A uniform array of vectors, keeping hold of them typed to change later
+function vec4Array(vectors: THREE.Vector4[]) {
+  return Object.assign(uniformArray<"vec4">(vectors, "vec4"), { array: vectors });
+}
+
 function createGrass(
   bladeCount: number,
   stains: Stains,
@@ -194,6 +202,8 @@ function createGrass(
     pushers: Array.from({ length: MAX_PUSHERS }, () =>
       uniform(new THREE.Vector4(NOWHERE, NOWHERE, NOWHERE, NOWHERE))
     ),
+    // And each one's radius and strength
+    pushes: Array.from({ length: MAX_PUSHERS }, () => uniform(new THREE.Vector3(1, 0, 1))),
     trailFadeStep: uniform(0),
     tipTint: uniform(new THREE.Vector3(1.0, 0.9, 0.6)),
     wetness: uniform(0),
@@ -206,23 +216,12 @@ function createGrass(
     sunColor: uniform(new THREE.Color(0x000000)),
     sunView: uniform(new THREE.Vector3(0, 1, 0)),
     lightCount: uniform(0, "int"),
-    lightPositions: uniformArray(
-      Array.from({ length: MAX_GRASS_LIGHTS }, () => new THREE.Vector4()),
-      "vec4"
-    ),
-    lightColors: uniformArray(
-      Array.from({ length: MAX_GRASS_LIGHTS }, () => new THREE.Vector4()),
-      "vec4"
-    ),
+    lightPositions: vec4Array(Array.from({ length: MAX_GRASS_LIGHTS }, () => new THREE.Vector4())),
+    lightColors: vec4Array(Array.from({ length: MAX_GRASS_LIGHTS }, () => new THREE.Vector4())),
     // Blood splats spreading this frame: x, z, radius, throw angle (the
     // Stains' own vectors), and how far each has spread, or NOT_PAINTING
-    stains: uniformArray(stains.spots, "vec4"),
-    stainReach: uniformArray(new Array<number>(MAX_STAINS).fill(NOT_PAINTING), "float"),
-    // Blood blobs landing this frame: x, z, radius
-    dents: uniformArray(
-      Array.from({ length: MAX_DENTS }, () => new THREE.Vector4(NOWHERE, NOWHERE, 0, 0)),
-      "vec4"
-    ),
+    stains: vec4Array(stains.spots),
+    stainReach: uniformArray<"float">(new Array<number>(MAX_STAINS).fill(NOT_PAINTING), "float"),
   };
 
   // Uniform arrays only upload once per render by default, after this
@@ -231,7 +230,6 @@ function createGrass(
   for (const array of [
     uniforms.stains,
     uniforms.stainReach,
-    uniforms.dents,
     uniforms.lightPositions,
     uniforms.lightColors,
   ]) {
@@ -248,6 +246,11 @@ function createGrass(
 
   // Springs up fast, then settles gently into rest over a fixed time
   const recovery = (life: THREE.Node<"float">) => life.mul(life);
+  // A cell's life shares its third channel with how fast it recovers: the
+  // speed in the whole part, the life in the fraction (full is just under 1)
+  const FULL_LIFE = 0.999;
+  const lifeOf = (z: THREE.Node<"float">) => fract(z);
+  const speedOf = (z: THREE.Node<"float">) => floor(z);
 
   // Fade the map back towards rest, then stamp the pushers' footprints
   const stampTrail = Fn(() => {
@@ -264,9 +267,10 @@ function createGrass(
     const id = tileId(tile).toVar();
 
     const trail = trailMap.element(instanceIndex);
+    const speed = speedOf(trail.z).toVar();
     const life = select(
       trail.w.equal(id),
-      max(trail.z.sub(uniforms.trailFadeStep), 0.0),
+      max(lifeOf(trail.z).sub(uniforms.trailFadeStep.mul(speed)), 0.0),
       0.0
     ).toVar();
     const current = trail.xy.mul(recovery(life)).toVar();
@@ -274,7 +278,9 @@ function createGrass(
     // Capsule from each pusher's last frame position to this frame's, so
     // fast movement leaves a continuous trail; the strongest one counts
     const stamp = vec2(0.0).toVar();
-    for (const path of uniforms.pushers) {
+    const stampSpeed = float(1.0).toVar();
+    uniforms.pushers.forEach((path, i) => {
+      const size = uniforms.pushes[i];
       const segStart = path.xy;
       const segment = path.zw.sub(segStart);
       const t = clamp(
@@ -284,47 +290,22 @@ function createGrass(
       );
       const toCell = cellPos.sub(segStart.add(segment.mul(t)));
       const distance = length(toCell);
-      const strength = smoothstep(
-        0.0,
-        1.0,
-        float(1.0).sub(distance.div(TRAIL_RADIUS))
-      ).mul(TRAIL_PUSH);
+      const strength = smoothstep(0.0, 1.0, float(1.0).sub(distance.div(size.x))).mul(size.y);
       const push = toCell.div(max(distance, 0.001)).mul(strength);
-      stamp.assign(select(dot(push, push).greaterThan(dot(stamp, stamp)), push, stamp));
-    }
+      const stronger = dot(push, push).greaterThan(dot(stamp, stamp));
+      stampSpeed.assign(select(stronger, size.z, stampSpeed));
+      stamp.assign(select(stronger, push, stamp));
+    });
 
     // Strongest push wins, so the stamp never weakens an existing trail
     trail.assign(
       select(
         dot(stamp, stamp).greaterThan(dot(current, current)),
-        vec4(stamp, 1.0, id),
-        vec4(trail.xy, life, id)
+        vec4(stamp, stampSpeed.add(FULL_LIFE), id),
+        vec4(trail.xy, speed.add(life), id)
       )
     );
   })().compute(TRAIL_RES * TRAIL_RES);
-
-  // Landing blood blobs knock a small round dent outwards: one square of
-  // cells around each, only run on frames when some land
-  const DENT_AREA = DENT_CELLS * DENT_CELLS;
-  const stampDents = Fn(() => {
-    const dent = uniforms.dents.element(instanceIndex.div(DENT_AREA));
-    const local = instanceIndex.mod(DENT_AREA);
-    const c = floor(dent.xy.div(TRAIL_TEXEL))
-      .sub(DENT_CELLS / 2)
-      .add(vec2(float(local.mod(DENT_CELLS)), float(local.div(DENT_CELLS))));
-    const { index, tile } = wrapCell(c);
-    const id = tileId(tile).toVar();
-    const toCell = c.add(0.5).mul(TRAIL_TEXEL).sub(dent.xy);
-    const distance = length(toCell);
-    const strength = smoothstep(0.0, 1.0, float(1.0).sub(distance.div(max(dent.z, 1e-3)))).mul(DENT_PUSH);
-    const push = toCell.div(max(distance, 0.001)).mul(strength).toVar();
-
-    const trail = trailMap.element(index);
-    const current = select(trail.w.equal(id), trail.xy.mul(recovery(trail.z)), vec2(0.0));
-    If(dot(push, push).greaterThan(dot(current, current)), () => {
-      trail.assign(vec4(push, 1.0, id));
-    });
-  })().compute(MAX_DENTS * DENT_AREA);
 
   // Blood: a cone sprayed out from the splat the way the bolt was going,
   // solid near its start and breaking up towards its ragged far end, with
@@ -370,6 +351,16 @@ function createGrass(
       If(blood.greaterThan(current).or(cell.y.notEqual(id)), () => {
         cell.assign(vec2(max(blood, current), id));
       });
+
+      // The blades it lands on pushed over away from the impact, by how
+      // bloody they are; the strongest push wins, as with trails
+      const away = pos.sub(stain.xy);
+      const push = away.div(max(length(away), 0.001)).mul(blood.mul(STAIN_PUSH)).toVar();
+      const trail = trailMap.element(index);
+      const pushed = select(trail.w.equal(id), trail.xy.mul(recovery(lifeOf(trail.z))), vec2(0.0));
+      If(dot(push, push).greaterThan(dot(pushed, pushed)), () => {
+        trail.assign(vec4(push, 1.0 + FULL_LIFE, id));
+      });
     });
   })().compute(MAX_STAINS * STAIN_AREA);
 
@@ -384,7 +375,7 @@ function createGrass(
       const trail = trailMap.element(index);
       return select(
         trail.w.equal(tileId(tile)),
-        trail.xy.mul(recovery(trail.z)),
+        trail.xy.mul(recovery(lifeOf(trail.z))),
         vec2(0.0)
       );
     };
@@ -695,14 +686,13 @@ function createGrass(
   return {
     uniforms,
     stampTrail,
-    stampDents,
     paintStains,
     update,
     material,
     dispose: () => {
       material.dispose();
       for (const buffer of buffers) buffer?.value.dispose?.();
-      for (const compute of [stampTrail, stampDents, paintStains, update]) compute.dispose();
+      for (const compute of [stampTrail, paintStains, update]) compute.dispose();
     },
   };
 }
@@ -793,8 +783,9 @@ export const grassSettings = {
 export function grassField(
   renderer: THREE.WebGPURenderer,
   stains: Stains,
-  // Feet positions that flatten the grass as they move, at most MAX_PUSHERS
-  pushers: Set<THREE.Vector3>,
+  // Positions that flatten the grass as they move, and how, at most
+  // MAX_PUSHERS
+  pushers: Map<THREE.Vector3, Push>,
   // Where the player is, for the shadow under it
   player: THREE.Vector3
 ) {
@@ -872,9 +863,10 @@ export function grassField(
     // where it is, so a spawn doesn't streak across the field
     const seen = new Map<THREE.Vector3, THREE.Vector2>();
     let slot = 0;
-    for (const position of pushers) {
+    for (const [position, push] of pushers) {
       if (slot === MAX_PUSHERS) break;
       const last = lastPushers.get(position) ?? new THREE.Vector2(position.x, position.z);
+      uniforms.pushes[slot].value.set(push.radius, push.strength, push.recovery);
       uniforms.pushers[slot++].value.set(last.x, last.y, position.x, position.z);
       seen.set(position, last.set(position.x, position.z));
     }
@@ -883,14 +875,6 @@ export function grassField(
 
     renderer.compute(grass.stampTrail);
 
-    // Dents are stamped once, on top of the trails
-    let landed = false;
-    stains.dents.forEach((dent, i) => {
-      uniforms.dents.array[i].set(dent.x, dent.y, dent.z, 0);
-      landed ||= dent.z > 0;
-    });
-    stains.clearDents();
-    if (landed) renderer.compute(grass.stampDents);
 
     // Stains are painted while they spread as their blood lands
     stains.update(delta);
@@ -903,5 +887,11 @@ export function grassField(
     renderer.compute(grass.update);
   }
 
-  return { mesh, rebuild, update };
+  // Runs the pass only run when blood lands, painting nothing, so it's
+  // compiled before it's needed
+  function compilePasses() {
+    renderer.compute(grass.paintStains);
+  }
+
+  return { mesh, rebuild, update, compilePasses };
 }

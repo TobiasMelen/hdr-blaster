@@ -1,6 +1,7 @@
 import * as THREE from "three/webgpu";
 import { Bot, type BotAssets } from "./bot";
 import type { BoltPool, Target } from "./bolts";
+import { FOOTSTEP, type Push } from "./grass";
 
 // Gold enemy bots: they appear past the top of the screen, walk down
 // towards the player, then hold at range, strafing and shooting. One player
@@ -50,7 +51,7 @@ const random = (min: number, max: number) => min + Math.random() * (max - min);
 export function createEnemies(
   assets: BotAssets,
   bolts: BoltPool,
-  grassPushers: Set<THREE.Vector3>,
+  grassPushers: Map<THREE.Vector3, Push>,
   player: THREE.Vector3,
   // Each enemy blown apart
   onKill: () => void
@@ -104,7 +105,7 @@ export function createEnemies(
     enemy.strafe = Math.random() < 0.5 ? -1 : 1;
     enemy.strafeTimer = random(1.5, 3);
     bolts.targets.add(enemy.target);
-    grassPushers.add(bot.position);
+    grassPushers.set(bot.position, FOOTSTEP);
   }
 
   // Eases towards intent (kept apart from the others) and faces the player
@@ -183,5 +184,15 @@ export function createEnemies(
     spawnTimer = 1;
   }
 
-  return { object: group, hunt, standDown, clear };
+  // Every enemy in and posed at once, so each one's shaders (one set per
+  // skeleton) compile; clear() sends them off again
+  function rehearse(camera: THREE.OrthographicCamera) {
+    for (let i = 0; i < MAX_ENEMIES; i++) arrive(camera);
+    for (const enemy of enemies) {
+      intent.set(0, 0, 0);
+      move(enemy, 1 / 60);
+    }
+  }
+
+  return { object: group, hunt, standDown, clear, rehearse };
 }

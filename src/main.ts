@@ -3,7 +3,7 @@ import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
 import Renderer from "three/src/renderers/common/Renderer.js";
 import WebGPUBackend from "three/src/renderers/webgpu/WebGPUBackend.js";
 import StandardNodeLibrary from "three/src/renderers/webgpu/nodes/StandardNodeLibrary.js";
-import { grassField, grassSettings, MAX_BLADE_HEIGHT, type GrassLook } from "./grass";
+import { FOOTSTEP, grassField, grassSettings, MAX_BLADE_HEIGHT, type GrassLook, type Push } from "./grass";
 import { createGround } from "./ground";
 import { createPlayer } from "./player";
 import { createEnemies } from "./enemies";
@@ -115,11 +115,14 @@ renderer.library = new StandardNodeLibrary();
 // Point lights (the laser bolts) only shade the pixels they reach
 renderer.lighting = new ClusteredLighting();
 // three sets the canvas up without a colour space, so sRGB: this adds
-// ours each time it does
-const gpuContext = renderer.domElement.getContext("webgpu")!;
+// ours each time it does. (TypeScript's own types have no WebGPU, so just
+// what's used here)
+type CanvasConfig = Record<string, unknown>;
+const gpuContext = renderer.domElement.getContext("webgpu") as unknown as {
+  configure(config: CanvasConfig): void;
+};
 const configure = gpuContext.configure.bind(gpuContext);
-gpuContext.configure = (config) =>
-  configure({ ...config, colorSpace: settings.p3 ? "display-p3" : "srgb" });
+gpuContext.configure = (config) => configure({ ...config, colorSpace: settings.p3 ? "display-p3" : "srgb" });
 await renderer.init();
 // The view: the whole window, or beside or above the sticks on touch
 // screens (see index.html)
@@ -136,17 +139,19 @@ const ambient = new THREE.AmbientLight();
 const sun = new THREE.DirectionalLight();
 const moon = new THREE.Mesh(
   new THREE.SphereGeometry(1, 32, 16),
-  new THREE.MeshBasicNodeMaterial({ fog: false })
+  new THREE.MeshBasicNodeMaterial({ fog: false, lights: false })
 );
 scene.add(ambient, sun, moon);
 
 const stains = new Stains();
-const bolts = new BoltPool(stains);
+// Everything that flattens the grass, and how: the player, enemies while
+// around, and bolts in flight
+const grassPushers = new Map<THREE.Vector3, Push>();
+const bolts = new BoltPool(stains, grassPushers);
 const [ground, botAssets] = await Promise.all([createGround(), loadBotAssets()]);
 const player = createPlayer(botAssets, bolts, createControls(renderer.domElement));
 const home = player.position.clone();
-// Everything that flattens the grass: the player, and enemies while around
-const grassPushers = new Set([player.position]);
+grassPushers.set(player.position, FOOTSTEP);
 // Kills this life, shown bottom left and on the game over screen
 let score = 0;
 const setScore = (value: number) => (document.getElementById("score-value")!.textContent = String((score = value)));
@@ -357,23 +362,36 @@ requestAnimationFrame(function tick(now) {
   if (settings.showFps) countFrame(now);
 });
 
-// Compiles every shader before play starts: shows whatever is hidden
-// (pooled enemies, idle bolts) for a few frames, so each material gets
-// drawn while the loading screen still covers the view
-const device = (renderer.backend as unknown as { device: GPUDevice }).device;
-const hidden: THREE.Object3D[] = [];
-scene.traverse((object) => {
-  if (!object.visible) hidden.push(object);
-});
-for (const object of hidden) object.visible = true;
-for (let i = 0; i < 3; i++) {
+// Compiles every shader before play starts, while the loading screen
+// covers the view: a rehearsal of what play draws, for a few frames. Every
+// enemy arrives and poses (each has shaders of its own), the player fires,
+// the blood pass runs painting nothing, and whatever else is hidden
+// (idle bolts' lights, debris) shows. Then all of it is cleared away
+const device = (renderer.backend as unknown as { device: { queue: { onSubmittedWorkDone(): Promise<void> } } })
+  .device;
+const muzzle = new THREE.Vector3();
+async function rehearse(onFrame?: (i: number) => void) {
+  const hidden: THREE.Object3D[] = [];
+  scene.traverse((object) => {
+    if (!object.visible) hidden.push(object);
+  });
+  for (const object of hidden) object.visible = true;
+  enemies.rehearse(camera);
+  bolts.fire("player", muzzle.copy(player.position).setY(1.2), player.aim);
+  grass.compilePasses();
+  for (let i = 0; i < 3; i++) {
+    redraw();
+    await new Promise(requestAnimationFrame);
+    onFrame?.(i);
+  }
+  await device.queue.onSubmittedWorkDone();
+  for (const object of hidden) object.visible = false;
+  enemies.clear();
+  bolts.clear();
   redraw();
-  await new Promise(requestAnimationFrame);
-  progress(0.8 + (0.15 * (i + 1)) / 3);
 }
-await device.queue.onSubmittedWorkDone();
+await rehearse((i) => progress(0.8 + (0.15 * (i + 1)) / 3));
 progress(1);
-for (const object of hidden) object.visible = false;
 setPhase("title");
 // Start and Respawn, or Enter while either shows
 for (const id of ["start", "respawn"]) document.getElementById(id)!.addEventListener("click", () => setPhase("waiting"));

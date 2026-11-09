@@ -2,7 +2,6 @@ import * as THREE from "three/webgpu";
 import {
   Fn,
   If,
-  Loop,
   clamp,
   dot,
   float,
@@ -58,9 +57,9 @@ const nearestPath = Fn(([xz]: [THREE.Node<"vec2">]) => {
   const second = vec4(0.0, 0.0, 0.0, 0.0).toVar();
   const firstSq = float(8.0).toVar();
   const secondSq = float(8.0).toVar();
-  Loop({ start: -1, end: 2, name: "y" }, ({ y }) => {
-    Loop({ start: -1, end: 2, name: "x" }, ({ x }) => {
-      const offset = vec2(float(x), float(y));
+  for (let y = -1; y <= 1; y++) {
+    for (let x = -1; x <= 1; x++) {
+      const offset = vec2(x, y);
       const toPoint = offset.add(hash22(cell.add(offset)).mul(0.8).add(0.1)).sub(local);
       const distanceSq = dot(toPoint, toPoint);
       If(distanceSq.lessThan(firstSq), () => {
@@ -72,8 +71,8 @@ const nearestPath = Fn(([xz]: [THREE.Node<"vec2">]) => {
         second.assign(vec4(toPoint, offset));
         secondSq.assign(distanceSq);
       });
-    });
-  });
+    }
+  }
 
   const border = dot(first.xy.add(second.xy).mul(0.5), normalize(second.xy.sub(first.xy)));
   // The same for both cells of the stretch, whichever is nearer. A gap's
@@ -112,7 +111,7 @@ const pathEdgeNoise = (xz: THREE.Node<"vec2">) => noise(xz.mul(0.9)).sub(0.5);
 // a path in y (0 at the grass edge, 1 well inside). Both with a noisy edge,
 // shared by the grass and the ground so they line up
 export const paths = Fn(([xz]: [THREE.Node<"vec2">]) => {
-  const path = texture(map, xz.sub(centre).div(MAP_SIZE).add(0.5)).level(0);
+  const path = texture(map, xz.sub(centre).div(MAP_SIZE).add(0.5)).level(float(0));
   const edge = pathEdgeNoise(xz);
   return vec2(smoothstep(0.3, 0.7, path.r.add(edge.mul(0.5))), smoothstep(0.0, 1.0, path.g.add(edge.mul(0.4))));
 });

@@ -3,12 +3,10 @@ import * as THREE from "three/webgpu";
 // Blood splats left on the grass where enemies die, which the grass paints
 // dark red, thrown out the way the killing bolt was going. Each spreads out
 // from the impact over a moment, as the blood lands, and is only painted
-// while it spreads, so a ring of the most recent ones is enough. Also the
-// dents blood blobs knock into the grass where they land, kept until the
-// grass has stamped them
+// while it spreads, so a ring of the most recent ones is enough. The grass
+// it lands on is pushed over too, away from the impact
 
 export const MAX_STAINS = 4;
-export const MAX_DENTS = 8;
 // Where unused stains sit, far from any grass
 const NOWHERE = 1e6;
 
@@ -35,24 +33,12 @@ export class Stains {
   private readonly ages = new Array<number>(MAX_STAINS).fill(SPREAD_TIME);
   private next = 0;
 
-  // Dents waiting for the grass: x, z and radius
-  readonly dents = Array.from(
-    { length: MAX_DENTS },
-    () => new THREE.Vector3(NOWHERE, NOWHERE, 0)
-  );
-  private nextDent = 0;
-
   add(x: number, z: number, direction: THREE.Vector3) {
     const radius = THREE.MathUtils.randFloat(...RADIUS);
     this.spots[this.next].set(x, z, radius, Math.atan2(direction.z, direction.x));
     this.ages[this.next] = 0;
     this.reach[this.next] = SPREAD_FROM;
     this.next = (this.next + 1) % MAX_STAINS;
-  }
-
-  dent(x: number, z: number, radius: number) {
-    this.dents[this.nextDent].set(x, z, radius);
-    this.nextDent = (this.nextDent + 1) % MAX_DENTS;
   }
 
   update(delta: number) {
@@ -63,10 +49,5 @@ export class Stains {
       const t = 1 - (1 - this.ages[i] / SPREAD_TIME) ** 2;
       this.reach[i] = THREE.MathUtils.lerp(SPREAD_FROM, SPREAD_TO, t);
     }
-  }
-
-  // Once the grass has its dents, they're done
-  clearDents() {
-    for (const dent of this.dents) dent.set(NOWHERE, NOWHERE, 0);
   }
 }

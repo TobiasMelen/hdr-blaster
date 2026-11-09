@@ -255,13 +255,13 @@ class ClusteredLightsNode extends LightsNode {
 
 	}
 
-	getTile( element ) {
+	getTile( element, cluster = this._screenClusterIndex ) {
 
 		element = int( element );
 
 		const stride = int( 4 );
 		const chunkOffset = element.div( stride );
-		const idx = this._screenClusterIndex.mul( int( this._chunksPerCluster ) ).add( chunkOffset );
+		const idx = cluster.mul( int( this._chunksPerCluster ) ).add( chunkOffset );
 
 		return this._lightIndexes.element( idx ).element( element.mod( stride ) );
 
@@ -354,9 +354,13 @@ class ClusteredLightsNode extends LightsNode {
 
 		Fn( () => {
 
+			// The fragment's cluster, worked out once rather than on every pass
+			// of the loop
+			const cluster = this._screenClusterIndex.toVar();
+
 			Loop( this.maxLightsPerCluster, ( { i } ) => {
 
-				const lightIndex = this.getTile( i );
+				const lightIndex = this.getTile( i, cluster );
 
 				If( lightIndex.equal( int( 0 ) ), () => {
 

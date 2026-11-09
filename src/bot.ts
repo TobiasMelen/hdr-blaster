@@ -171,7 +171,7 @@ export async function loadBotAssets(): Promise<BotAssets> {
 
   const clips = gltf.animations;
   // Recoil as an offset from the clip's first frame, layered on top
-  const recoil = THREE.AnimationClip.findByName(clips, "fire").clone();
+  const recoil = THREE.AnimationClip.findByName(clips, "fire")!.clone();
   recoil.tracks = recoil.tracks.filter((track) => !LOWER_BODY.test(track.name));
   THREE.AnimationUtils.makeClipAdditive(recoil);
 
@@ -230,7 +230,8 @@ export class Bot {
     this.object.add(this.body, this.rifle);
 
     this.mixer = new THREE.AnimationMixer(model);
-    const clip = (name: string) => THREE.AnimationClip.findByName(assets.clips, name);
+    // The model ships with every clip asked for
+    const clip = (name: string) => THREE.AnimationClip.findByName(assets.clips, name)!;
     // Locomotion clips are posed by setting their time directly from phase
     const gait = (name: string): Gait => {
       const action = this.mixer.clipAction(clip(name));
