@@ -199,7 +199,6 @@ function createGrass(
     wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
     shininess: uniform(30),
-    ridge: uniform(0.6),
     // The scene's lights, mirrored for bladeLit: colours scaled by
     // intensity, the sun's direction in view space, and each point light's
     // position and range, colour and decay
@@ -641,18 +640,10 @@ function createGrass(
   // Face normal follows the bend
   const faceNormal = bladeNormal(axis, look.xy, bend.xy, bend.z, bend.w, uvY);
 
-  // Normal tilts across the blade, blended from a round profile to a
-  // V-shaped midrib ridge. Done per fragment since the blade has no centre
-  // vertices; the soft sign keeps the crease from aliasing. Flipped for
-  // back faces
-  const bladeX = uv().x.sub(0.5).mul(2.0);
-  const roundTilt = bladeX.mul(0.75);
-  const ridgeTilt = bladeX.div(abs(bladeX).add(0.12)).mul(0.6);
-  const localNormal = normalize(
-    varying(faceNormal).add(
-      varying(vec3(axis.x, 0.0, axis.y)).mul(mix(roundTilt, ridgeTilt, uniforms.ridge))
-    )
-  );
+  // Normal tilts across the blade for a round profile. Done per fragment
+  // since the blade has no centre vertices. Flipped for back faces
+  const roundTilt = uv().x.sub(0.5).mul(1.5);
+  const localNormal = normalize(varying(faceNormal).add(varying(vec3(axis.x, 0.0, axis.y)).mul(roundTilt)));
   const normal = transformNormalToView(localNormal)
     .normalize()
     .mul(faceDirection);
@@ -666,7 +657,7 @@ function createGrass(
     // The same Phong maths three would do. The blade's point light, blended
     // up from root to tip in the vertex shader
     const point = varying(mix(bladeLightRoot.toAttribute(), bladeLightTip.toAttribute(), uvY));
-    // The sun per pixel, so it still picks out the ridge
+    // The sun per pixel, so it shades across the round blade
     const sunNL = saturate(dot(normal, uniforms.sunView));
     const sunLight = sunNL.mul(uniforms.sunColor);
     const half = uniforms.sunView.add(positionViewDirection).normalize();
@@ -792,7 +783,6 @@ export const grassSettings = {
   bladeHeight: 2,
   windSpeed: 1.0,
   trailRecovery: 10,
-  ridge: 0.6,
   // Lights the grass itself, point lights once per blade, instead of with
   // three's per pixel lights
   bladeLit: true,
@@ -858,7 +848,6 @@ export function grassField(
     uniforms.time.value = time;
     uniforms.windSpeed.value = grassSettings.windSpeed;
     uniforms.grassHeight.value = grassSettings.bladeHeight;
-    uniforms.ridge.value = grassSettings.ridge;
     uniforms.trailFadeStep.value = delta / grassSettings.trailRecovery;
     uniforms.specular.value.set(look.specular);
     uniforms.shininess.value = look.shininess;

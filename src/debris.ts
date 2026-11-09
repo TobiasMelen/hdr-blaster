@@ -65,13 +65,14 @@ export class Debris {
     }
   }
 
-  // Throw a burst from a point on along a level direction
-  burst(from: THREE.Vector3, direction: THREE.Vector3) {
+  // Throw a burst on along a level direction, from a point, or from
+  // anywhere along this far back from it
+  burst(from: THREE.Vector3, direction: THREE.Vector3, along = 0) {
     const { style } = this;
     for (let i = 0; i < style.perBurst; i++) {
       const bit = this.bits[this.next];
       this.next = (this.next + 1) % style.pool;
-      bit.position.copy(from);
+      bit.position.copy(from).addScaledVector(direction, -Math.random() * along);
       if (style.body) {
         const angle = Math.random() * Math.PI * 2;
         const reach = Math.sqrt(Math.random()) * style.body.radius;

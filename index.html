@@ -83,6 +83,12 @@
       }
       body:not([data-phase="loading"], [data-phase="title"]) #score { opacity: 1; }
       #score span { color: var(--ink); margin-right: 0.6em; font-weight: 500; }
+      /* Frames drawn per second, top middle, when Show FPS is on */
+      #fps {
+        position: fixed; top: calc(8px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+        color: var(--ink); font: 500 12px/1 "Tektur", system-ui, sans-serif; letter-spacing: 0.15em;
+        pointer-events: none; z-index: 1;
+      }
 
       /* The settings panel, in the landing screen's colours, square. Body
          first, to win over lil-gui's own, which it adds after this */
@@ -158,6 +164,7 @@
     <div id="view"><div id="score"><span>Blasted</span><b id="score-value">0</b></div></div>
     <div id="move" class="stick"><span>Move</span><div class="knob"></div></div>
     <div id="blast" class="stick"><span>Blast</span><div class="knob"></div></div>
+    <div id="fps" hidden></div>
     <div id="game-over" class="screen">
       <h1>GAME OVER</h1>
       <p id="final-score"></p>

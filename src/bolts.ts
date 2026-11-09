@@ -1,10 +1,5 @@
 import * as THREE from "three/webgpu";
 import {
-  Discard,
-  Fn,
-  If,
-  length,
-  max,
   mrt,
   output,
   vec4,
@@ -15,7 +10,6 @@ import {
   saturate,
   sin,
   uniform,
-  varying,
   vec3,
 } from "three/tsl";
 import { Debris, type DebrisStyle } from "./debris";
@@ -24,8 +18,8 @@ import type { Stains } from "./stains";
 // Red laser bolts, shared by everyone who shoots. Each flies level from
 // where it was fired and ends on the first target of another team it
 // passes through, or after BOLT_LIFE. A hit blows the target apart: the
-// bolt's light flashes, and it splats against it, with sparks and blood
-// blown on the way the bolt was going
+// bolt bursts into sparks and blood thrown from along its front, on the
+// way it was going, and its light flashes
 
 const BOLT_SPEED = 70; // metres per second
 const BOLT_LIFE = 0.7; // seconds
@@ -43,25 +37,19 @@ const BOLT_RADIUS = 0.035;
 // come and go, but every light it holds costs on every lit pixel near it
 const POOL_SIZE = 14;
 const LIGHT_INTENSITY = 32;
-const LIGHT_COLOR = "#ff1006";
-const LIGHT_RANGE = 10;
+const LIGHT_COLOR = "#a0280a";
+const LIGHT_RANGE = 14;
 // The light flashes this many times brighter as the orb leaves the muzzle,
 // dying down as it stretches into a bolt
-const MUZZLE_FLASH = 4;
+const MUZZLE_FLASH = 2;
 
-// The burst on an exploding hit: the light flashes and dies over
-// BURST_TIME. The bolt keeps flowing into the impact, slowed, and splats:
-// whatever reaches the impact squashes outwards into a cone splashing back
-// the way it came, and is gone once it has spread SPLAT_REACH
+// The burst on a hit: the bolt bursts into its debris, thrown from along
+// its front, and its light flashes and dies over BURST_TIME
 const BURST_TIME = 0.25; // seconds
 const BURST_LIGHT = 380; // light intensity at the flash
-const BURST_LIGHT_RANGE = 16;
-const SPLAT_SPEED = 40; // metres per second, flowing into the impact
-const SPLAT_SPREAD = 0.4; // metres outwards per metre that has flowed in
-const SPLAT_BACK = 0.12; // metres back per metre that has flowed in
-const SPLAT_REACH = 0.6; // metres flowed in before it's gone
-// Where the bolt's mesh is cut while flying: nowhere
-const UNCUT = 1e6;
+const BURST_LIGHT_RANGE = 22;
+// Share of the bolt, from its front, that the debris is thrown from
+const BURST_ALONG = 0.2;
 
 // Sparks: hot streaks blown on in a cone along the bolt's way, slowing and
 // falling
@@ -78,7 +66,7 @@ const SPARKS: DebrisStyle = {
   width: 0.18,
   stretch: 0.065,
   shrink: 1,
-  // From all over the splat rather than one point
+  // From all over the body rather than one line
   body: { radius: 0.3, below: 0.15 },
 };
 
@@ -186,11 +174,8 @@ export class BoltPool {
   readonly group = new THREE.Group();
   readonly targets = new Set<Target>();
   private readonly bolts: Bolt[] = [];
-  // Enough rows along it for the splat to bend it smoothly
-  private readonly geometry = new THREE.CapsuleGeometry(BOLT_RADIUS, BOLT_LENGTH, 4, 8, 40);
+  private readonly geometry = new THREE.CapsuleGeometry(BOLT_RADIUS, BOLT_LENGTH, 4, 8);
   private readonly material = new THREE.MeshBasicNodeMaterial();
-  // Seen from inside too, once it splats
-  private readonly boltMaterial = new THREE.MeshBasicNodeMaterial({ side: THREE.DoubleSide });
   private next = 0;
   private readonly time = uniform(0);
   private readonly sparkGeometry = new THREE.BoxGeometry(1, 1, 1);
@@ -220,30 +205,10 @@ export class BoltPool {
     this.material.colorNode = vec3(4.5, 0.12, 0.075);
     this.material.mrtNode = mrt({ output: vec4(output.rgb, 0.0) });
 
-    // The splat, in the bolt's own space (along y, front at +y): past each
-    // bolt's cut, the impact, it folds back and spreads out, and is dropped
-    // once it has flowed in SPLAT_REACH
-    const cutAt = uniform(UNCUT).onObjectUpdate(({ object }) => object!.userData.cut);
-    const flowed = max(positionLocal.y.sub(cutAt), 0.0);
-    const across = length(positionLocal.xz);
-    const spread = across.add(flowed.mul(SPLAT_SPREAD)).div(max(across, 1e-4));
-    this.boltMaterial.positionNode = vec3(
-      positionLocal.x.mul(spread),
-      positionLocal.y.min(cutAt).sub(flowed.mul(SPLAT_BACK)),
-      positionLocal.z.mul(spread)
-    );
-    const gone = varying(flowed).greaterThan(SPLAT_REACH);
-    this.boltMaterial.colorNode = Fn(() => {
-      If(gone, () => Discard());
-      return this.material.colorNode!;
-    })();
-    this.boltMaterial.mrtNode = this.material.mrtNode;
-
     for (let i = 0; i < POOL_SIZE; i++) {
-      const mesh = new THREE.Mesh(this.geometry, this.boltMaterial);
+      const mesh = new THREE.Mesh(this.geometry, this.material);
       mesh.visible = false;
       mesh.frustumCulled = false;
-      mesh.userData.cut = UNCUT;
       const light = new THREE.PointLight(LIGHT_COLOR, 0, LIGHT_RANGE, 2);
       light.visible = false;
 
@@ -295,7 +260,6 @@ export class BoltPool {
     bolt.origin.copy(muzzle);
     bolt.direction.copy(direction).setY(0).normalize();
     bolt.mesh.quaternion.setFromUnitVectors(yAxis, bolt.direction);
-    bolt.mesh.userData.cut = UNCUT;
     bolt.mesh.visible = true;
   }
 
@@ -324,7 +288,7 @@ export class BoltPool {
         this.stains.add(target.position.x, target.position.z, bolt.direction);
         this.targets.delete(target);
         target.hit();
-        this.explode(bolt, target, head);
+        this.explode(bolt, target);
         continue;
       }
       bolt.head = head;
@@ -340,27 +304,27 @@ export class BoltPool {
     this.mist.update(delta);
   }
 
-  // Turn the bolt into a burst where it met the target, its front head
-  // along its way
-  private explode(bolt: Bolt, target: Target, head: number) {
+  // Burst the bolt where its front met the target: gone, its debris thrown
+  // from along its front, the light flashing at the impact
+  private explode(bolt: Bolt, target: Target) {
     const along =
       (target.position.x - bolt.origin.x) * bolt.direction.x +
       (target.position.z - bolt.origin.z) * bolt.direction.z;
     impact.copy(bolt.origin).addScaledVector(bolt.direction, along);
+    const length = Math.min(BOLT_LENGTH * bolt.mesh.scale.y * BURST_ALONG, along);
     bolt.state = "bursting";
     bolt.time = 0;
     bolt.origin.copy(impact);
-    bolt.head = head - along;
+    bolt.mesh.visible = false;
     bolt.light.distance = BURST_LIGHT_RANGE;
     bolt.light.position.copy(impact);
 
-    this.sparks.burst(impact, bolt.direction);
-    this.blood.burst(impact, bolt.direction);
-    this.mist.burst(impact, bolt.direction);
+    this.sparks.burst(impact, bolt.direction, length);
+    this.blood.burst(impact, bolt.direction, length);
+    this.mist.burst(impact, bolt.direction, length);
   }
 
-  // The bolt flowing into the impact and splatting, and the light flashing
-  // and dying
+  // The light flashing and dying
   private updateBurst(bolt: Bolt, delta: number) {
     bolt.time += delta;
     if (bolt.time >= BURST_TIME) {
@@ -368,14 +332,6 @@ export class BoltPool {
       return;
     }
     bolt.light.intensity = BURST_LIGHT * (1 - bolt.time / BURST_TIME) ** 2;
-
-    // Its front this far past the impact, in metres and in the mesh's own
-    // units along it (scaled by its length)
-    const front = bolt.head + SPLAT_SPEED * bolt.time;
-    const length = bolt.mesh.scale.y;
-    bolt.mesh.visible = front < BOLT_LENGTH * length + SPLAT_REACH;
-    bolt.mesh.position.copy(bolt.origin).addScaledVector(bolt.direction, front - (BOLT_LENGTH * length) / 2);
-    bolt.mesh.userData.cut = ((BOLT_LENGTH * length) / 2 - front) / length;
   }
 
   private sweep(bolt: Bolt, from: number, to: number) {
@@ -389,6 +345,11 @@ export class BoltPool {
       return target;
     }
     return null;
+  }
+
+  // Where bolts are bursting, and seconds since each began
+  *bursts() {
+    for (const bolt of this.bolts) if (bolt.state === "bursting") yield { position: bolt.origin, time: bolt.time };
   }
 
   // Every bolt gone, flying or bursting. Debris settles on its own
@@ -411,6 +372,5 @@ export class BoltPool {
     this.mistGeometry.dispose();
     this.mistMaterial.dispose();
     this.material.dispose();
-    this.boltMaterial.dispose();
   }
 }

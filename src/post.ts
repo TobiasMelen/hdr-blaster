@@ -5,6 +5,9 @@ import {
   cineonToneMapping,
   dot,
   float,
+  Fn,
+  If,
+  length,
   linearToneMapping,
   luminance,
   max,
@@ -17,7 +20,12 @@ import {
   reinhardToneMapping,
   renderOutput,
   saturate,
+  screenSize,
+  screenUV,
+  smoothstep,
   sRGBTransferOETF,
+  step,
+  vec2,
   vec3,
   uniform,
   vec4,
@@ -52,6 +60,32 @@ const GLOW_PER_BOOST = 0.15;
 export const hdrBoost = uniform(8.0);
 // 0 in colour to 1 black and white, of the finished image (game over)
 export const greyscale = uniform(0.0);
+
+// Shockwaves where something blew apart: a ring that pushes the image
+// outwards, growing to SHOCKWAVE_RADIUS (of the screen's height) and fading
+// over SHOCKWAVE_TIME. Each is its screen position (uv) and progress, 0 to
+// 1, or below 0 for none
+const MAX_SHOCKWAVES = 4;
+const SHOCKWAVE_TIME = 0.25; // seconds, as long as the burst
+const SHOCKWAVE_RADIUS = 0.14;
+const SHOCKWAVE_WIDTH = 0.035;
+const SHOCKWAVE_PUSH = 0.02;
+const shockwaves = Array.from({ length: MAX_SHOCKWAVES }, () => uniform(new THREE.Vector4(0, 0, -1, 0)));
+// How many are on: none, and the pass skips them altogether
+const shockwaveCount = uniform(0, "int");
+const onScreen = new THREE.Vector3();
+
+// From bursts' world positions and seconds since each began
+export function updateShockwaves(camera: THREE.Camera, bursts: Iterable<{ position: THREE.Vector3; time: number }>) {
+  let count = 0;
+  for (const { position, time } of bursts) {
+    if (count === MAX_SHOCKWAVES || time > SHOCKWAVE_TIME) continue;
+    onScreen.copy(position).project(camera);
+    shockwaves[count++].value.set((onScreen.x + 1) / 2, (1 - onScreen.y) / 2, time / SHOCKWAVE_TIME, 0);
+  }
+  shockwaveCount.value = count;
+  for (; count < MAX_SHOCKWAVES; count++) shockwaves[count].value.z = -1;
+}
 const HDR_CORE = [1.0, 0.4, 0.12] as const;
 // Linear sRGB to linear Display P3, by rows
 const SRGB_TO_P3 = [
@@ -93,7 +127,23 @@ export function createPost(
   const scenePass = pass(scene, camera, { samples: msaa ? 4 : 0 });
   // Materials (the bolts') merge their own outputs into this
   scenePass.setMRT(mrt({ output }));
-  const color = scenePass.getTextureNode();
+  // The scene, as the shockwaves push it about
+  const aspect = vec2(screenSize.x.div(screenSize.y), 1.0);
+  const push = Fn(() => {
+    const sum = vec2(0.0).toVar();
+    If(shockwaveCount.greaterThan(0), () => {
+      for (const wave of shockwaves) {
+        const away = screenUV.sub(wave.xy).mul(aspect);
+        const distance = length(away);
+        const ring = smoothstep(SHOCKWAVE_WIDTH, 0.0, distance.sub(wave.z.mul(SHOCKWAVE_RADIUS)).abs())
+          .mul(wave.z.oneMinus())
+          .mul(step(0.0, wave.z));
+        sum.addAssign(away.div(max(distance, 1e-4)).mul(ring.mul(SHOCKWAVE_PUSH)).div(aspect));
+      }
+    });
+    return sum;
+  })();
+  const color = scenePass.getTextureNode().sample(screenUV.sub(push));
   const mask = saturate(color.a.oneMinus());
   const glow = bloom(
     color.mul(mask),

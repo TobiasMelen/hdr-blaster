@@ -7,7 +7,7 @@ import { grassField, grassSettings, MAX_BLADE_HEIGHT, type GrassLook } from "./g
 import { createGround } from "./ground";
 import { createPlayer } from "./player";
 import { createEnemies } from "./enemies";
-import { createPost, greyscale, hdrBoost, TONE_MAPPINGS } from "./post";
+import { createPost, greyscale, hdrBoost, TONE_MAPPINGS, updateShockwaves } from "./post";
 import { loadBotAssets } from "./bot";
 import { BoltPool } from "./bolts";
 import { Stains } from "./stains";
@@ -68,6 +68,7 @@ const settings = {
   p3: p3Screen,
   hdrBoost: hdrBoost.value,
   toneMapping: "ACES Filmic",
+  showFps: false,
 };
 const SAVED = "settings";
 try {
@@ -199,7 +200,16 @@ function sizeCanvas() {
   renderer.setSize(viewElement.clientWidth, viewElement.clientHeight);
 }
 
+// While time stands still (see frame) the same picture would be drawn
+// over and over, so it's only drawn again once something changes how it
+// looks: redraw() asks for that
+let stale = true;
+function redraw() {
+  stale = true;
+}
+
 function resize() {
+  redraw();
   sizeCanvas();
   const size = viewSize(viewElement.clientWidth, viewElement.clientHeight);
   camera.top = size.height / 2;
@@ -216,7 +226,12 @@ window.addEventListener("resize", resize);
 
 // Bottom right, closed until opened, and hidden while loading. The game
 // pauses while it's open
-const gui = new GUI({ title: "Settings" }).onChange(save).close();
+const gui = new GUI({ title: "Settings" })
+  .onChange(() => {
+    save();
+    redraw();
+  })
+  .close();
 let paused = false;
 gui.$title.addEventListener("click", () => (paused = !gui._closed));
 Object.assign(gui.domElement.style, { top: "auto", bottom: "0" });
@@ -224,6 +239,7 @@ const graphicsGui = gui.addFolder("Graphics").close();
 graphicsGui.add(settings, "resolution", { "2x": 2, "1.5x": 1.5, "1x": 1 }).name("Resolution").onChange(resize);
 graphicsGui.add(settings, "msaa").name("MSAA 4x").onChange(rebuildPost);
 graphicsGui.add(settings, "fps", { "60": 60, Display: 0 }).name("Frame rate cap");
+graphicsGui.add(settings, "showFps").name("Show FPS").onChange(showFps);
 graphicsGui.add(settings, "toneMapping", Object.keys(TONE_MAPPINGS)).name("Tone Mapping").onChange(rebuildPost);
 graphicsGui.add(settings, "hdr").name("HDR").disable(!hdrScreen).onChange(setOutput);
 graphicsGui.add(settings, "p3").name("Display P3").disable(!p3Screen).onChange(setOutput);
@@ -238,7 +254,6 @@ grassGui.add(grassSettings, "density", 10, 200, 5).name("Density").onChange(resi
 grassGui.add(grassSettings, "bladeHeight", 0.7, MAX_BLADE_HEIGHT, 0.1).name("Blade Height");
 grassGui.add(grassSettings, "windSpeed", 0, 5, 0.1).name("Wind Speed");
 grassGui.add(grassSettings, "trailRecovery", 0.2, 20, 0.1).name("Trail Recovery");
-grassGui.add(grassSettings, "ridge", 0, 1, 0.05).name("Blade Ridge");
 grassGui.add(grassSettings, "bladeLit").name("Blade Lighting").onChange(resize);
 
 // Where the game is: loading, the title screen, waiting for the player's
@@ -250,6 +265,7 @@ type Phase = "loading" | "title" | "waiting" | "playing" | "dying" | "over";
 let phase: Phase = "loading";
 let phaseTime = 0; // real seconds
 function setPhase(next: Phase) {
+  redraw();
   phase = next;
   phaseTime = 0;
   document.body.dataset.phase = next;
@@ -267,10 +283,12 @@ const lead = new THREE.Vector3();
 const screenUp = new THREE.Vector3(ISO_UP[0], 0, ISO_UP[1]);
 const view = new THREE.Vector3();
 
-// Paused, everything holds still but still gets drawn, so settings changes
-// show
+// Time stands still while loading, on the title screen and while settings
+// are open
+const timeStands = () => paused || phase === "loading" || phase === "title";
+
 function frame(delta: number) {
-  if (paused || phase === "loading" || phase === "title") delta = 0;
+  if (timeStands()) delta = 0;
   phaseTime += delta;
   if (phase === "dying" && phaseTime >= GAME_OVER_DELAY) setPhase("over");
   const fade = phase === "over" ? 1 : phase === "dying" ? THREE.MathUtils.smoothstep(phaseTime, 0, DEATH_EASE) : 0;
@@ -302,18 +320,42 @@ function frame(delta: number) {
   ground.time.value = elapsed;
   updatePaths(renderer, player.position);
   grass.update(delta, elapsed, scene, camera, preset.grass);
+  updateShockwaves(camera, bolts.bursts());
   post.render();
 }
 
 // Driven by display refreshes, skipping some to hold the frame rate cap
 let last = performance.now();
 let burning = false;
+
+// Frames drawn per second, counted only while shown, over half a second
+const fpsText = document.getElementById("fps")!;
+let fpsFrames = 0;
+let fpsSince = 0;
+function showFps() {
+  fpsText.hidden = !settings.showFps;
+  fpsFrames = 0;
+  fpsSince = performance.now();
+}
+showFps();
+function countFrame(now: number) {
+  fpsFrames++;
+  if (now - fpsSince < 500) return;
+  fpsText.textContent = `${Math.round((fpsFrames * 1000) / (now - fpsSince))} fps`;
+  fpsFrames = 0;
+  fpsSince = now;
+}
+
 requestAnimationFrame(function tick(now) {
   requestAnimationFrame(tick);
   // A little early is fine: refreshes never land exactly on the interval
   if (burning || now - last < (settings.fps ? 1000 / settings.fps - 2 : 0)) return;
-  frame(Math.min((now - last) / 1000, 0.1));
+  const delta = Math.min((now - last) / 1000, 0.1);
   last = now;
+  if (timeStands() && !stale) return;
+  stale = false;
+  frame(delta);
+  if (settings.showFps) countFrame(now);
 });
 
 // Compiles every shader before play starts: shows whatever is hidden
@@ -326,6 +368,7 @@ scene.traverse((object) => {
 });
 for (const object of hidden) object.visible = true;
 for (let i = 0; i < 3; i++) {
+  redraw();
   await new Promise(requestAnimationFrame);
   progress(0.8 + (0.15 * (i + 1)) / 3);
 }
