@@ -46,11 +46,10 @@ const LOOK_AHEAD_VERTICAL = 2.2;
 const LOOK_AHEAD_RATE = 1.8; // per second
 const FOLLOW_RATE = 4; // per second
 
-// Blown apart, the world slows to SLOW_MOTION and drains to black and
+// Blown apart, the world slows to a standstill and drains to black and
 // white over DEATH_EASE seconds, and the game over screen shows after
-// GAME_OVER_DELAY (seconds of real time)
-const SLOW_MOTION = 0.2;
-const DEATH_EASE = 0.8;
+// GAME_OVER_DELAY (seconds of real time), over the frozen frame
+const DEATH_EASE = 1.2;
 const GAME_OVER_DELAY = 1.4;
 
 // Dev settings. On a 2x display, 1.5x resolution and no multisampling each
@@ -283,9 +282,9 @@ const lead = new THREE.Vector3();
 const screenUp = new THREE.Vector3(ISO_UP[0], 0, ISO_UP[1]);
 const view = new THREE.Vector3();
 
-// Time stands still while loading, on the title screen and while settings
-// are open
-const timeStands = () => paused || phase === "loading" || phase === "title";
+// Time stands still while loading, on the title screen, once the game is
+// over and while settings are open
+const timeStands = () => paused || phase === "loading" || phase === "title" || phase === "over";
 
 function frame(delta: number) {
   if (timeStands()) delta = 0;
@@ -293,7 +292,7 @@ function frame(delta: number) {
   if (phase === "dying" && phaseTime >= GAME_OVER_DELAY) setPhase("over");
   const fade = phase === "over" ? 1 : phase === "dying" ? THREE.MathUtils.smoothstep(phaseTime, 0, DEATH_EASE) : 0;
   greyscale.value = fade;
-  delta *= THREE.MathUtils.lerp(1, SLOW_MOTION, fade);
+  delta *= 1 - fade;
   if (delta > 0) {
     elapsed += delta;
     player.update(delta, camera);
