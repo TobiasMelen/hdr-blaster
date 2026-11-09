@@ -23,8 +23,8 @@ import type { Stains } from "./stains";
 
 // Red laser bolts, shared by everyone who shoots. Each flies level from
 // where it was fired and ends on the first target of another team it
-// passes through, or after BOLT_LIFE. A hit on something that explodes
-// flashes its light, and the bolt splats against it, with sparks and blood
+// passes through, or after BOLT_LIFE. A hit blows the target apart: the
+// bolt's light flashes, and it splats against it, with sparks and blood
 // blown on the way the bolt was going
 
 const BOLT_SPEED = 70; // metres per second
@@ -153,14 +153,14 @@ const MIST: DebrisStyle = {
 
 export type Team = "player" | "enemy";
 
-// Something bolts can hit: an upright cylinder at a ground position
+// Something bolts can hit: an upright cylinder at a ground position. A hit
+// blows it apart: the bolt bursts, its blood stains the grass, it stops
+// being a target, and hit() is told
 export type Target = {
   team: Team;
   position: THREE.Vector3;
   radius: number;
-  explodes: boolean;
-  // Called with the bolt's level direction of travel
-  hit: (direction: THREE.Vector3) => void;
+  hit: () => void;
 };
 
 type Bolt = {
@@ -169,10 +169,11 @@ type Bolt = {
   team: Team;
   origin: THREE.Vector3;
   direction: THREE.Vector3;
-  // Distance of the front end from the origin; once burst, from the impact
+  // Distance of the front end from the origin; once bursting, from the
+  // impact
   head: number;
-  age: number;
-  burst: number; // time since it burst, or -1 while flying
+  state: "idle" | "flying" | "bursting";
+  time: number; // seconds in that state
 };
 
 
@@ -210,7 +211,10 @@ export class BoltPool {
   private readonly sparks: Debris;
   private readonly blood: Debris;
 
+  private readonly stains: Stains;
+
   constructor(stains: Stains) {
+    this.stains = stains;
     // Over-bright so it stays saturated deep red after tone mapping, and
     // flagged for the selective bloom pass by a zero alpha
     this.material.colorNode = vec3(4.5, 0.12, 0.075);
@@ -251,8 +255,8 @@ export class BoltPool {
         origin: new THREE.Vector3(),
         direction: new THREE.Vector3(),
         head: 0,
-        age: BOLT_LIFE,
-        burst: -1,
+        state: "idle",
+        time: 0,
       });
     }
 
@@ -283,9 +287,9 @@ export class BoltPool {
     const bolt = this.bolts[this.next];
     this.next = (this.next + 1) % this.bolts.length;
     bolt.team = team;
-    bolt.age = 0;
+    bolt.state = "flying";
+    bolt.time = 0;
     bolt.head = 0;
-    bolt.burst = -1;
     bolt.light.distance = LIGHT_RANGE;
     bolt.light.visible = true;
     bolt.origin.copy(muzzle);
@@ -298,31 +302,29 @@ export class BoltPool {
   update(delta: number) {
     this.time.value += delta;
     for (const bolt of this.bolts) {
-      if (bolt.burst >= 0) {
-        this.updateBurst(bolt, delta);
-        continue;
-      }
-      if (bolt.age >= BOLT_LIFE) continue;
-      bolt.age += delta;
-      if (bolt.age >= BOLT_LIFE) {
+      if (bolt.state === "bursting") this.updateBurst(bolt, delta);
+      if (bolt.state !== "flying") continue;
+      bolt.time += delta;
+      if (bolt.time >= BOLT_LIFE) {
         this.end(bolt);
         continue;
       }
-      const grown = Math.min(bolt.age / BOLT_GROW, 1);
+      const grown = Math.min(bolt.time / BOLT_GROW, 1);
       const ease = 1 - (1 - grown) * (1 - grown);
       const width = THREE.MathUtils.lerp(ORB_WIDTH, 1, ease);
       const length = THREE.MathUtils.lerp(ORB_LENGTH, 1, ease);
       bolt.mesh.scale.set(width, length, width);
       // Tail at the muzzle while growing, then the whole bolt flies on
-      const travelled = Math.max(bolt.age - BOLT_GROW, 0) * BOLT_SPEED;
+      const travelled = Math.max(bolt.time - BOLT_GROW, 0) * BOLT_SPEED;
       const head = travelled + BOLT_LENGTH * length;
 
       // Hits anything of another team the front swept past this frame
       const target = this.sweep(bolt, bolt.head, head);
       if (target) {
-        target.hit(bolt.direction);
-        if (target.explodes) this.explode(bolt, target, head);
-        else this.end(bolt);
+        this.stains.add(target.position.x, target.position.z, bolt.direction);
+        this.targets.delete(target);
+        target.hit();
+        this.explode(bolt, target, head);
         continue;
       }
       bolt.head = head;
@@ -345,7 +347,8 @@ export class BoltPool {
       (target.position.x - bolt.origin.x) * bolt.direction.x +
       (target.position.z - bolt.origin.z) * bolt.direction.z;
     impact.copy(bolt.origin).addScaledVector(bolt.direction, along);
-    bolt.burst = 0;
+    bolt.state = "bursting";
+    bolt.time = 0;
     bolt.origin.copy(impact);
     bolt.head = head - along;
     bolt.light.distance = BURST_LIGHT_RANGE;
@@ -359,17 +362,16 @@ export class BoltPool {
   // The bolt flowing into the impact and splatting, and the light flashing
   // and dying
   private updateBurst(bolt: Bolt, delta: number) {
-    bolt.burst += delta;
-    if (bolt.burst >= BURST_TIME) {
-      bolt.burst = -1;
+    bolt.time += delta;
+    if (bolt.time >= BURST_TIME) {
       this.end(bolt);
       return;
     }
-    bolt.light.intensity = BURST_LIGHT * (1 - bolt.burst / BURST_TIME) ** 2;
+    bolt.light.intensity = BURST_LIGHT * (1 - bolt.time / BURST_TIME) ** 2;
 
     // Its front this far past the impact, in metres and in the mesh's own
     // units along it (scaled by its length)
-    const front = bolt.head + SPLAT_SPEED * bolt.burst;
+    const front = bolt.head + SPLAT_SPEED * bolt.time;
     const length = bolt.mesh.scale.y;
     bolt.mesh.visible = front < BOLT_LENGTH * length + SPLAT_REACH;
     bolt.mesh.position.copy(bolt.origin).addScaledVector(bolt.direction, front - (BOLT_LENGTH * length) / 2);
@@ -391,14 +393,11 @@ export class BoltPool {
 
   // Every bolt gone, flying or bursting. Debris settles on its own
   clear() {
-    for (const bolt of this.bolts) {
-      bolt.burst = -1;
-      this.end(bolt);
-    }
+    for (const bolt of this.bolts) this.end(bolt);
   }
 
   private end(bolt: Bolt) {
-    bolt.age = BOLT_LIFE;
+    bolt.state = "idle";
     bolt.mesh.visible = false;
     bolt.light.intensity = 0;
     bolt.light.visible = false;

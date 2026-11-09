@@ -37,7 +37,7 @@ import {
   Loop,
   positionViewDirection,
 } from "three/tsl";
-import { ISO_ELEVATION, ISO_OFFSET, ISO_RIGHT, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { ISO_ELEVATION, ISO_OFFSET, ISO_RIGHT, ISO_UP } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
 import { paths } from "./worldMap";
 import { MAX_DENTS, MAX_STAINS, type Stains } from "./stains";
@@ -196,8 +196,6 @@ function createGrass(
     ),
     trailFadeStep: uniform(0),
     tipTint: uniform(new THREE.Vector3(1.0, 0.9, 0.6)),
-    sunDirection: uniform(new THREE.Vector3(0, 1, 0)),
-    translucency: uniform(0),
     wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
     shininess: uniform(30),
@@ -659,23 +657,6 @@ function createGrass(
     .normalize()
     .mul(faceDirection);
 
-  // Backlit glow: sunlight shining through blades seen against the sun.
-  // Compared in the ground plane so a high sun still reads from a
-  // downward-looking camera. Uses the flat face normal so only blades
-  // turned with their back to the sun light up, each with a lime streak
-  // down its middle fading to green edges
-  const backlight = Fn(() => {
-    const sunXZ = normalize(uniforms.sunDirection.xz);
-    const against = smoothstep(-0.3, 1.0, dot(viewUp, sunXZ));
-    const cameraSideFace = varying(faceNormal).normalize().mul(faceDirection);
-    const facing = saturate(dot(cameraSideFace.xz, sunXZ).negate());
-    const across = abs(uv().x.sub(0.5)).mul(2.0);
-    const streak = float(1.0).sub(across.mul(across));
-    const glow = against.mul(facing.mul(facing)).mul(streak).mul(uvY.mul(0.6).add(0.4));
-    const glowColor = mix(vec3(0.12, 0.45, 0.03), vec3(0.4, 0.8, 0.05), streak.mul(streak));
-    return glowColor.mul(glow).mul(uniforms.translucency);
-  })();
-
   // Fake AO: speculars strongest at the tips, fading into the dense base.
   // Wet blades shine further down
   const specular = uniforms.specular.mul(smoothstep(uniforms.wetness.mul(-0.6), 1.0, uvY));
@@ -706,14 +687,12 @@ function createGrass(
     basic.lights = false;
     basic.colorNode = diffuse
       .add(sunLight.mul(reflectance).mul(highlight).mul(0.25))
-      .add(point.xyz.mul(specular).mul(point.w))
-      .add(backlight);
+      .add(point.xyz.mul(specular).mul(point.w));
     material = basic;
   } else {
     const phong = new THREE.MeshPhongNodeMaterial({ side: THREE.DoubleSide });
     phong.colorNode = varying(color);
     phong.normalNode = normal;
-    phong.emissiveNode = backlight;
     phong.specularNode = specular;
     phong.shininessNode = uniforms.shininess;
     material = phong;
@@ -742,8 +721,6 @@ export type GrassLook = {
   shininess: number;
   // Raw (non color-managed) tint multiplied into bright blade tips
   tipTint: [number, number, number];
-  // Strength of the backlit glow, 0 disables it
-  translucency: number;
   // 0 dry to 1 soaked: darker blades, gloss further down the blade
   wetness: number;
 };
@@ -807,10 +784,12 @@ function mirrorLights(
   uniforms.lightCount.value = count;
 }
 
-// Sliders for the field; density and height (and bladeLit) rebuild it
+// Sliders for the field; density (and bladeLit) rebuild it. The field
+// always reaches far enough below the screen for blades this tall
+export const MAX_BLADE_HEIGHT = 4;
 export const grassSettings = {
   density: 55,
-  bladeHeight: 1.5,
+  bladeHeight: 2,
   windSpeed: 1.0,
   trailRecovery: 10,
   ridge: 0.6,
@@ -842,13 +821,14 @@ export function grassField(
   // ground axes relative to the point at the centre of the screen
   const grid = { cellSize: 1, columns: 0, minRight: 0, minUp: 0 };
 
-  function rebuild(aspect: number) {
-    const { density, bladeHeight, bladeLit } = grassSettings;
+  // The view's size in world units, across and up the screen
+  function rebuild(viewWidth: number, viewHeight: number) {
+    const { density, bladeLit } = grassSettings;
     grid.cellSize = 1 / Math.sqrt(density);
-    const width = ISO_VIEW_HEIGHT * aspect + 2 * BEND_MARGIN;
-    const depth = ISO_VIEW_HEIGHT / Math.sin(ISO_ELEVATION);
+    const width = viewWidth + 2 * BEND_MARGIN;
+    const depth = viewHeight / Math.sin(ISO_ELEVATION);
     // Blades rooted below the bottom edge still reach up into view
-    const nearMargin = (bladeHeight + 0.8) / Math.tan(ISO_ELEVATION) + BEND_MARGIN;
+    const nearMargin = (MAX_BLADE_HEIGHT + 0.8) / Math.tan(ISO_ELEVATION) + BEND_MARGIN;
     grid.columns = Math.ceil(width / grid.cellSize);
     grid.minRight = -width / 2;
     grid.minUp = -depth / 2 - nearMargin;
@@ -860,7 +840,6 @@ export function grassField(
     mesh.material = grass.material;
     grass.uniforms.gridWidth.value = grid.columns;
     grass.uniforms.cellSize.value = grid.cellSize;
-    grass.uniforms.grassHeight.value = bladeHeight;
   }
 
   function dispose() {
@@ -873,20 +852,18 @@ export function grassField(
     time: number,
     scene: THREE.Scene,
     camera: THREE.Camera,
-    look: GrassLook,
-    sunPosition: [number, number, number]
+    look: GrassLook
   ) {
     const { uniforms } = grass;
     uniforms.time.value = time;
     uniforms.windSpeed.value = grassSettings.windSpeed;
+    uniforms.grassHeight.value = grassSettings.bladeHeight;
     uniforms.ridge.value = grassSettings.ridge;
     uniforms.trailFadeStep.value = delta / grassSettings.trailRecovery;
     uniforms.specular.value.set(look.specular);
     uniforms.shininess.value = look.shininess;
     uniforms.tipTint.value.fromArray(look.tipTint);
-    uniforms.translucency.value = look.translucency;
     uniforms.wetness.value = look.wetness;
-    uniforms.sunDirection.value.fromArray(sunPosition).normalize();
     uniforms.spherePosition.value.copy(player);
     if (grassSettings.bladeLit) mirrorLights(scene, camera, uniforms);
 

@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <title>HDR Grass Blast</title>
     <link rel="preload" href="/fonts/tektur-latin.woff2" as="font" type="font/woff2" crossorigin />
@@ -21,6 +21,7 @@
       }
       body { margin: 0; overflow: hidden; background: #070b16; }
       canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; }
+      #view { position: fixed; inset: 0; overflow: hidden; }
       :root {
         --night: #070b16;
         --ink: #8fa0c8;
@@ -28,8 +29,9 @@
         --line: #2a3352;
       }
       /* Full-view screens: the landing one, then game over */
+      /* Over the view and the sticks */
       .screen {
-        position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+        z-index: 1; position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
         justify-content: center; gap: 28px; padding: 16px; box-sizing: border-box; text-align: center;
         color: var(--ink); font-family: "Tektur", system-ui, sans-serif;
         transition: opacity 0.6s ease, background-color 1.2s ease;
@@ -75,7 +77,7 @@
       #game-over p { margin: -8px 0 0; color: var(--ink-bright); font-size: clamp(18px, 2.4vw, 26px); }
 
       #score {
-        position: fixed; left: 16px; bottom: 12px; color: var(--ink-bright); pointer-events: none;
+        position: absolute; left: 16px; bottom: 12px; color: var(--ink-bright); pointer-events: none;
         font: 600 16px/1 "Tektur", system-ui, sans-serif; letter-spacing: 0.2em; text-transform: uppercase;
         text-shadow: 0 1px 6px rgb(7 11 22 / 0.8); opacity: 0; transition: opacity 0.6s ease;
       }
@@ -105,6 +107,43 @@
       body .lil-gui.root { border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
       body .lil-gui .title { text-transform: uppercase; letter-spacing: 0.15em; font-weight: 600; }
       body .lil-gui.root > .title { border-bottom: 1px solid var(--line); }
+
+      /* Touch screens: small Move and Blast sticks over the view's bottom
+         corners, the view fading into the night behind them: along the
+         bottom when upright, at the sides when sideways */
+      .stick { display: none; }
+      @media (pointer: coarse) {
+        :root { --stick: min(22vmin, 96px); --gap: 14px; --fade: calc(var(--stick) + 3 * var(--gap)); }
+        #view::after {
+          content: ""; position: absolute; inset: 0; pointer-events: none;
+          background: linear-gradient(to top, rgb(7 11 22 / 0.85), transparent var(--fade));
+        }
+        @media (orientation: landscape) {
+          #view::after {
+            background:
+              linear-gradient(to right, rgb(7 11 22 / 0.85), transparent var(--fade)),
+              linear-gradient(to left, rgb(7 11 22 / 0.85), transparent var(--fade));
+          }
+        }
+        #score { z-index: 1; }
+        .stick {
+          display: grid; place-items: center; position: fixed; bottom: calc(var(--gap) + env(safe-area-inset-bottom));
+          width: var(--stick); aspect-ratio: 1; border: 1px solid var(--line); border-radius: 50%;
+          background: rgb(143 160 200 / 0.05); touch-action: none; user-select: none; -webkit-user-select: none;
+          color: var(--ink); font: 600 9px/1 "Tektur", system-ui, sans-serif; letter-spacing: 0.2em;
+          text-transform: uppercase;
+        }
+        #move { left: calc(var(--gap) + env(safe-area-inset-left)); }
+        #blast { right: calc(var(--gap) + env(safe-area-inset-right)); }
+        .stick span { position: absolute; bottom: 10%; }
+        .stick .knob {
+          position: absolute; width: 42%; aspect-ratio: 1; border: 1px solid var(--ink); border-radius: 50%;
+          background: rgb(143 160 200 / 0.12);
+        }
+        /* Settings and score at the top, out of the sticks' way */
+        body .lil-gui.root.autoPlace { top: 0 !important; bottom: auto !important; }
+        #score { top: calc(10px + env(safe-area-inset-top)); bottom: auto; }
+      }
     </style>
   </head>
   <body data-phase="loading">
@@ -116,7 +155,9 @@
         <button id="start" type="button">Start</button>
       </div>
     </div>
-    <div id="score"><span>Blasted</span><b id="score-value">0</b></div>
+    <div id="view"><div id="score"><span>Blasted</span><b id="score-value">0</b></div></div>
+    <div id="move" class="stick"><span>Move</span><div class="knob"></div></div>
+    <div id="blast" class="stick"><span>Blast</span><div class="knob"></div></div>
     <div id="game-over" class="screen">
       <h1>GAME OVER</h1>
       <p id="final-score"></p>

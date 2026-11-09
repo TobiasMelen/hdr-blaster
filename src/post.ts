@@ -48,8 +48,6 @@ export const TONE_MAPPINGS = {
   // None: clips at white
   Linear: linearToneMapping,
 };
-const HIGHLIGHT_KEEP = 0.6;
-const HDR_HIGHLIGHT_KEEP = 1.0;
 const GLOW_PER_BOOST = 0.15;
 export const hdrBoost = uniform(8.0);
 // 0 in colour to 1 black and white, of the finished image (game over)
@@ -61,12 +59,10 @@ const SRGB_TO_P3 = [
   [0.0331941, 0.9668058, 0.0],
   [0.0170827, 0.0723974, 0.9105199],
 ] as const;
-// Glow strength and spread (0 to 1), more of both on an HDR canvas, which
-// has room above white
-const BLOOM = 2.0;
-const HDR_BLOOM = 3.0;
-const BLOOM_RADIUS = 0.6;
-const HDR_BLOOM_RADIUS = 0.8;
+// Per canvas: glow strength and spread (0 to 1), and how much of what lies
+// above white is kept. More of all on an HDR one, which has room for it
+const SDR_LOOK = { bloom: 2.0, radius: 0.6, keep: 0.6 };
+const HDR_LOOK = { bloom: 3.0, radius: 0.8, keep: 1.0 };
 // Final night grade, before tone mapping. Most colour drains to a blue
 // monochrome (SATURATION 1 keeps the colours as rendered, 0 is all tint),
 // then contrast steepens around a mid grey and exposure darkens it
@@ -76,19 +72,24 @@ const CONTRAST = 1.09;
 const CONTRAST_PIVOT = 0.18;
 const EXPOSURE = 0.97;
 
+export type PostOptions = {
+  // Multisampled here if at all: the scene is the only pass with edges
+  msaa: boolean;
+  // The canvas takes values past white, or shows Display P3 (see main)
+  hdr: boolean;
+  p3: boolean;
+  // A TONE_MAPPINGS name, ACES Filmic if unknown
+  toneMapping: string;
+};
+
 export function createPost(
   renderer: THREE.WebGPURenderer,
   scene: THREE.Scene,
   camera: THREE.Camera,
-  // Multisampled here if at all: the scene is the only pass with edges
-  msaa: boolean,
-  // The canvas takes values past white (see main)
-  hdrOutput: boolean,
-  // The canvas shows Display P3 (see main)
-  p3Output: boolean,
-  // A TONE_MAPPINGS name, ACES Filmic if unknown
-  toneMapping: string
+  { msaa, hdr: hdrOutput, p3, toneMapping }: PostOptions
 ) {
+  const look = hdrOutput ? HDR_LOOK : SDR_LOOK;
+  const boost = hdrOutput ? hdrBoost : float(0.0);
   const scenePass = pass(scene, camera, { samples: msaa ? 4 : 0 });
   // Materials (the bolts') merge their own outputs into this
   scenePass.setMRT(mrt({ output }));
@@ -96,8 +97,8 @@ export function createPost(
   const mask = saturate(color.a.oneMinus());
   const glow = bloom(
     color.mul(mask),
-    hdrOutput ? HDR_BLOOM : BLOOM,
-    hdrOutput ? HDR_BLOOM_RADIUS : BLOOM_RADIUS,
+    look.bloom,
+    look.radius,
     0.0
   );
   // Quarter resolution (default half): the glow is soft anyway, and this
@@ -106,7 +107,7 @@ export function createPost(
   // Grade everything but the bolts, so they stay pure red
   const rgb = color.rgb;
   const [r, g, b] = SRGB_TO_P3.map((row) => dot(rgb, vec3(...row)));
-  const base = p3Output ? mix(vec3(r, g, b), rgb, mask) : rgb;
+  const base = p3 ? mix(vec3(r, g, b), rgb, mask) : rgb;
   const blue = vec3(luminance(base)).mul(vec3(...TINT));
   const toned = mix(blue, base, SATURATION);
   const contrasted = pow(max(toned, 0.0).div(CONTRAST_PIVOT), vec3(CONTRAST))
@@ -114,11 +115,9 @@ export function createPost(
   const hdr = mix(contrasted, base, mask).add(glow.rgb);
   const curve = TONE_MAPPINGS[toneMapping as keyof typeof TONE_MAPPINGS] ?? acesFilmicToneMapping;
   const filmic = curve(hdr, float(1.0));
-  const over = max((hdrOutput ? hdr.add(glow.rgb.mul(hdrBoost.mul(GLOW_PER_BOOST))) : hdr).sub(1.0), 0.0);
+  const over = max(hdr.add(glow.rgb.mul(boost.mul(GLOW_PER_BOOST))).sub(1.0), 0.0);
   const whiteHot = vec3(max(base.r, max(base.g, base.b))).mul(mask).mul(vec3(...HDR_CORE));
-  const highlights = vec3(
-    hdrOutput ? over.mul(HDR_HIGHLIGHT_KEEP).add(whiteHot.mul(hdrBoost)) : over.mul(HIGHLIGHT_KEEP)
-  );
+  const highlights = over.mul(look.keep).add(whiteHot.mul(boost));
 
   const final = filmic.add(highlights);
 

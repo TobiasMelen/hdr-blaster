@@ -1,8 +1,6 @@
 import * as THREE from "three/webgpu";
-import { ISO_RIGHT, ISO_UP } from "./iso";
 import { Bot, type BotAssets } from "./bot";
 import type { BoltPool, Target } from "./bolts";
-import type { Stains } from "./stains";
 
 // Gold enemy bots: they appear past the top of the screen, walk down
 // towards the player, then hold at range, strafing and shooting. One player
@@ -11,29 +9,32 @@ import type { Stains } from "./stains";
 
 const MAX_ENEMIES = 4;
 const SPAWN_INTERVAL = 2.5; // seconds between arrivals while below the max
-// Where they appear: this far up the screen's vertical from the player
-// (past the top edge even with the camera leading upwards), spread across
-const SPAWN_DISTANCE = 34; // metres along the ground
-const SPAWN_SPREAD = 14; // metres either side
+// Where they appear: this far past the top of the screen (world units up
+// it), anywhere across its middle SPAWN_SPREAD
+const SPAWN_PAST_TOP = 3;
+const SPAWN_SPREAD = 0.8;
 const DESPAWN_DISTANCE = 60; // wandered this far off, gone
 
 const APPROACH_SPEED = 3.2; // metres per second
 const STRAFE_SPEED = 1.6;
 const ACCELERATION = 4; // how quickly velocity reaches the intent, per second
 const ATTACK_RANGE = 12; // holds about this far from the player
-const FIRE_RANGE = 26; // starts shooting from this close, on the way in
-const FIRE_INTERVAL: [number, number] = [0.9, 1.6]; // seconds, random between
+// Seconds between shots, random between. A shot due while off screen is
+// skipped, so one arriving waits out the rest of its tick
+const FIRE_INTERVAL: [number, number] = [0.9, 1.6];
 const AIM_ERROR = 0.15; // radians either side
 const PERSONAL_SPACE = 2.2; // metres kept between enemies
 
 const HIT_RADIUS = 0.6;
 
-const up = new THREE.Vector3(ISO_UP[0], 0, ISO_UP[1]);
-const right = new THREE.Vector3(ISO_RIGHT[0], 0, ISO_RIGHT[1]);
 const toPlayer = new THREE.Vector3();
 const intent = new THREE.Vector3();
 const away = new THREE.Vector3();
 const shot = new THREE.Vector3();
+const onScreen = new THREE.Vector3();
+const spawnAt = new THREE.Vector2();
+const raycaster = new THREE.Raycaster();
+const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 
 type Enemy = {
   bot: Bot;
@@ -50,7 +51,6 @@ export function createEnemies(
   assets: BotAssets,
   bolts: BoltPool,
   grassPushers: Set<THREE.Vector3>,
-  stains: Stains,
   player: THREE.Vector3,
   // Each enemy blown apart
   onKill: () => void
@@ -75,9 +75,7 @@ export function createEnemies(
         team: "enemy",
         position: bot.position,
         radius: HIT_RADIUS,
-        explodes: true,
-        hit: (direction) => {
-          stains.add(bot.position.x, bot.position.z, direction);
+        hit: () => {
           leave(enemy);
           onKill();
         },
@@ -90,44 +88,58 @@ export function createEnemies(
     enemies.push(enemy);
   }
 
-  function update(delta: number) {
-    // Arrivals
+  // One arriving past the top of the screen, from the pool
+  function arrive(camera: THREE.OrthographicCamera) {
+    const enemy = enemies.find((e) => !e.active);
+    if (!enemy) return;
+    const { bot } = enemy;
+    bot.velocity.set(0, 0, 0);
+    spawnAt.set(random(-SPAWN_SPREAD, SPAWN_SPREAD), 1 + SPAWN_PAST_TOP / camera.top);
+    raycaster.setFromCamera(spawnAt, camera);
+    raycaster.ray.intersectPlane(ground, bot.position);
+    bot.face(toPlayer.subVectors(player, bot.position));
+    bot.object.visible = true;
+    enemy.active = true;
+    enemy.cooldown = random(...FIRE_INTERVAL);
+    enemy.strafe = Math.random() < 0.5 ? -1 : 1;
+    enemy.strafeTimer = random(1.5, 3);
+    bolts.targets.add(enemy.target);
+    grassPushers.add(bot.position);
+  }
+
+  // Eases towards intent (kept apart from the others) and faces the player
+  function move(enemy: Enemy, delta: number) {
+    const { bot } = enemy;
+    for (const other of enemies) {
+      if (other === enemy || !other.active) continue;
+      away.subVectors(bot.position, other.bot.position).setY(0);
+      const gap = away.length();
+      if (gap < PERSONAL_SPACE && gap > 1e-3) intent.addScaledVector(away, ((PERSONAL_SPACE - gap) / gap) * 2);
+    }
+    bot.velocity.lerp(intent, 1 - Math.exp(-delta * ACCELERATION));
+    bot.update(delta, toPlayer.subVectors(player, bot.position).setY(0));
+  }
+
+  // Arrivals, then each closes in until at range and circles the player,
+  // easing in or out to hold that range, and shoots at it, not quite dead
+  // on, but only from inside the camera's view
+  function hunt(delta: number, camera: THREE.OrthographicCamera) {
     spawnTimer -= delta;
     if (spawnTimer <= 0) {
       spawnTimer = SPAWN_INTERVAL;
-      const enemy = enemies.find((e) => !e.active);
-      if (enemy) {
-        const { bot } = enemy;
-        bot.velocity.set(0, 0, 0);
-        bot.position
-          .copy(player)
-          .addScaledVector(up, SPAWN_DISTANCE)
-          .addScaledVector(right, random(-SPAWN_SPREAD, SPAWN_SPREAD));
-        bot.face(toPlayer.subVectors(player, bot.position));
-        bot.object.visible = true;
-        enemy.active = true;
-        enemy.cooldown = random(...FIRE_INTERVAL);
-        enemy.strafe = Math.random() < 0.5 ? -1 : 1;
-        enemy.strafeTimer = random(1.5, 3);
-        bolts.targets.add(enemy.target);
-        grassPushers.add(bot.position);
-      }
+      arrive(camera);
     }
-
     for (const enemy of enemies) {
       if (!enemy.active) continue;
       const { bot } = enemy;
       toPlayer.subVectors(player, bot.position).setY(0);
       const distance = toPlayer.length();
-      toPlayer.divideScalar(Math.max(distance, 1e-3));
-
       if (distance > DESPAWN_DISTANCE) {
         leave(enemy);
         continue;
       }
+      toPlayer.divideScalar(Math.max(distance, 1e-3));
 
-      // Close in until at range, then circle the player, easing in or out
-      // to hold that range
       enemy.strafeTimer -= delta;
       if (enemy.strafeTimer <= 0) {
         enemy.strafe = -enemy.strafe;
@@ -141,22 +153,13 @@ export function createEnemies(
           .multiplyScalar(enemy.strafe * STRAFE_SPEED)
           .addScaledVector(toPlayer, THREE.MathUtils.clamp(distance - ATTACK_RANGE, -1, 1) * STRAFE_SPEED);
       }
-      // Keep apart from the others
-      for (const other of enemies) {
-        if (other === enemy || !other.active) continue;
-        away.subVectors(bot.position, other.bot.position).setY(0);
-        const gap = away.length();
-        if (gap < PERSONAL_SPACE && gap > 1e-3) {
-          intent.addScaledVector(away, ((PERSONAL_SPACE - gap) / gap) * 2);
-        }
-      }
-      bot.velocity.lerp(intent, 1 - Math.exp(-delta * ACCELERATION));
-      bot.update(delta, toPlayer);
+      move(enemy, delta);
 
-      // Shoot at the player, not quite dead on
       enemy.cooldown -= delta;
-      if (enemy.cooldown <= 0 && distance < FIRE_RANGE) {
-        enemy.cooldown = random(...FIRE_INTERVAL);
+      if (enemy.cooldown > 0) continue;
+      enemy.cooldown = random(...FIRE_INTERVAL);
+      onScreen.copy(bot.position).project(camera);
+      if (Math.abs(onScreen.x) < 0.95 && Math.abs(onScreen.y) < 0.95) {
         shot.copy(player).sub(bot.muzzle).setY(0).normalize();
         shot.applyAxisAngle(THREE.Object3D.DEFAULT_UP, random(-AIM_ERROR, AIM_ERROR));
         bolts.fire("enemy", bot.muzzle, shot);
@@ -165,11 +168,20 @@ export function createEnemies(
     }
   }
 
-  // All gone, the next arriving shortly after update resumes
+  // Each comes to a standstill where it is
+  function standDown(delta: number) {
+    for (const enemy of enemies) {
+      if (!enemy.active) continue;
+      intent.set(0, 0, 0);
+      move(enemy, delta);
+    }
+  }
+
+  // All gone, the next arriving shortly after hunting resumes
   function clear() {
     for (const enemy of enemies) if (enemy.active) leave(enemy);
     spawnTimer = 1;
   }
 
-  return { object: group, update, clear };
+  return { object: group, hunt, standDown, clear };
 }

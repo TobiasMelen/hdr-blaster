@@ -3,7 +3,7 @@ import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
 import Renderer from "three/src/renderers/common/Renderer.js";
 import WebGPUBackend from "three/src/renderers/webgpu/WebGPUBackend.js";
 import StandardNodeLibrary from "three/src/renderers/webgpu/nodes/StandardNodeLibrary.js";
-import { grassField, grassSettings, type GrassLook } from "./grass";
+import { grassField, grassSettings, MAX_BLADE_HEIGHT, type GrassLook } from "./grass";
 import { createGround } from "./ground";
 import { createPlayer } from "./player";
 import { createEnemies } from "./enemies";
@@ -12,8 +12,9 @@ import { loadBotAssets } from "./bot";
 import { BoltPool } from "./bolts";
 import { Stains } from "./stains";
 import { ClusteredLighting } from "./lighting/ClusteredLighting";
-import { ISO_OFFSET, ISO_UP, ISO_VIEW_HEIGHT } from "./iso";
+import { ISO_OFFSET, ISO_UP, viewSize } from "./iso";
 import { updatePaths } from "./worldMap";
+import { createControls } from "./controls";
 
 type ScenePreset = {
   background: string;
@@ -24,23 +25,15 @@ type ScenePreset = {
   grass: GrassLook;
 };
 
+// Scenes the game could be set in; only the night one so far
 const SCENES: Record<string, ScenePreset> = {
-  Day: {
-    background: "#c2e2ff",
-    ambient: { color: "#ffffff", intensity: 0.4 },
-    // From the upper left of the iso view, low enough to rake across the
-    // path relief and partly behind the grass for the backlit glow
-    light: { position: [-10, 7, 1.4], color: "#FFFFCC", intensity: 1 },
-    grass: { specular: "#55554a", shininess: 30, tipTint: [1.0, 0.9, 0.6], translucency: 0.35, wetness: 0 },
-  },
   Moon: {
     background: "#070b16",
     fog: { color: "#070b16", near: 60, far: 150 },
     ambient: { color: "#6e80d8", intensity: 1.25 },
-    // Same general direction as the Day sun
     light: { position: [-49, 50, 7], color: "#b4d6c4", intensity: 1.45 },
     moon: { position: [-245, 250, 35], radius: 9, color: "#eef2ff" },
-    grass: { specular: "#b8ccc0", shininess: 20, tipTint: [0.75, 0.85, 1.0], translucency: 0, wetness: 1 },
+    grass: { specular: "#b8ccc0", shininess: 20, tipTint: [0.75, 0.85, 1.0], wetness: 1 },
   },
 };
 
@@ -68,7 +61,6 @@ const GAME_OVER_DELAY = 1.4;
 const hdrScreen = matchMedia("(dynamic-range: high)").matches;
 const p3Screen = matchMedia("(color-gamut: p3)").matches;
 const settings = {
-  scene: "Moon",
   resolution: 2,
   msaa: true,
   fps: 60,
@@ -129,7 +121,10 @@ const configure = gpuContext.configure.bind(gpuContext);
 gpuContext.configure = (config) =>
   configure({ ...config, colorSpace: settings.p3 ? "display-p3" : "srgb" });
 await renderer.init();
-document.body.prepend(renderer.domElement);
+// The view: the whole window, or beside or above the sticks on touch
+// screens (see index.html)
+const viewElement = document.getElementById("view")!;
+viewElement.prepend(renderer.domElement);
 progress(0.1);
 
 const scene = new THREE.Scene();
@@ -148,18 +143,18 @@ scene.add(ambient, sun, moon);
 const stains = new Stains();
 const bolts = new BoltPool(stains);
 const [ground, botAssets] = await Promise.all([createGround(), loadBotAssets()]);
-const player = createPlayer(botAssets, bolts, renderer.domElement, stains);
+const player = createPlayer(botAssets, bolts, createControls(renderer.domElement));
 const home = player.position.clone();
 // Everything that flattens the grass: the player, and enemies while around
 const grassPushers = new Set([player.position]);
 // Kills this life, shown bottom left and on the game over screen
 let score = 0;
 const setScore = (value: number) => (document.getElementById("score-value")!.textContent = String((score = value)));
-const enemies = createEnemies(botAssets, bolts, grassPushers, stains, player.position, () => setScore(score + 1));
+const enemies = createEnemies(botAssets, bolts, grassPushers, player.position, () => setScore(score + 1));
 const grass = grassField(renderer, stains, grassPushers, player.position);
 scene.add(ground.mesh, grass.mesh, player.object, enemies.object, bolts.group);
 progress(0.75);
-const makePost = () => createPost(renderer, scene, camera, settings.msaa, settings.hdr, settings.p3, settings.toneMapping);
+const makePost = () => createPost(renderer, scene, camera, settings);
 let post = makePost();
 function rebuildPost() {
   post.dispose();
@@ -181,8 +176,8 @@ function setOutput() {
     boostControl.disable(!settings.hdr);
 }
 
+const preset = SCENES.Moon;
 function applyScene() {
-  const preset = SCENES[settings.scene];
   scene.background = new THREE.Color(preset.background);
   scene.fog = preset.fog ? new THREE.Fog(preset.fog.color, preset.fog.near, preset.fog.far) : null;
   ambient.color.set(preset.ambient.color);
@@ -201,18 +196,18 @@ function applyScene() {
 
 function sizeCanvas() {
   renderer.setPixelRatio(Math.min(settings.resolution, window.devicePixelRatio));
-  renderer.setSize(innerWidth, innerHeight);
+  renderer.setSize(viewElement.clientWidth, viewElement.clientHeight);
 }
 
 function resize() {
   sizeCanvas();
-  const aspect = innerWidth / innerHeight;
-  camera.top = ISO_VIEW_HEIGHT / 2;
+  const size = viewSize(viewElement.clientWidth, viewElement.clientHeight);
+  camera.top = size.height / 2;
   camera.bottom = -camera.top;
-  camera.right = camera.top * aspect;
+  camera.right = size.width / 2;
   camera.left = -camera.right;
   camera.updateProjectionMatrix();
-  grass.rebuild(aspect);
+  grass.rebuild(size.width, size.height);
 }
 
 applyScene();
@@ -225,8 +220,7 @@ const gui = new GUI({ title: "Settings" }).onChange(save).close();
 let paused = false;
 gui.$title.addEventListener("click", () => (paused = !gui._closed));
 Object.assign(gui.domElement.style, { top: "auto", bottom: "0" });
-gui.add(settings, "scene", Object.keys(SCENES)).name("Scene").onChange(applyScene);
-const graphicsGui = gui.addFolder("Graphics");
+const graphicsGui = gui.addFolder("Graphics").close();
 graphicsGui.add(settings, "resolution", { "2x": 2, "1.5x": 1.5, "1x": 1 }).name("Resolution").onChange(resize);
 graphicsGui.add(settings, "msaa").name("MSAA 4x").onChange(rebuildPost);
 graphicsGui.add(settings, "fps", { "60": 60, Display: 0 }).name("Frame rate cap");
@@ -239,18 +233,19 @@ const boostControl = graphicsGui
   .name("HDR Boost")
   .disable(!settings.hdr)
   .onChange((value: number) => (hdrBoost.value = value));
-const grassGui = gui.addFolder("Grass Field");
-grassGui.add(grassSettings, "density", 10, 200, 5).name("Density").onFinishChange(resize);
-grassGui.add(grassSettings, "bladeHeight", 0.7, 4, 0.1).name("Blade Height").onFinishChange(resize);
+const grassGui = gui.addFolder("Grass Field").close();
+grassGui.add(grassSettings, "density", 10, 200, 5).name("Density").onChange(resize);
+grassGui.add(grassSettings, "bladeHeight", 0.7, MAX_BLADE_HEIGHT, 0.1).name("Blade Height");
 grassGui.add(grassSettings, "windSpeed", 0, 5, 0.1).name("Wind Speed");
 grassGui.add(grassSettings, "trailRecovery", 0.2, 20, 0.1).name("Trail Recovery");
 grassGui.add(grassSettings, "ridge", 0, 1, 0.05).name("Blade Ridge");
 grassGui.add(grassSettings, "bladeLit").name("Blade Lighting").onChange(resize);
 
 // Where the game is: loading, the title screen, waiting for the player's
-// first move (enemies held off), playing, dying (slowing and draining to
-// grey) and over, then back to waiting, which revives the player where it
-// fell. On <body> too, which shows the screens
+// first move (enemies held off), playing, dying (enemies standing down,
+// slowing and draining to grey) and over, then back to waiting, which
+// clears them and revives the player where it fell. On <body> too, which
+// shows the screens
 type Phase = "loading" | "title" | "waiting" | "playing" | "dying" | "over";
 let phase: Phase = "loading";
 let phaseTime = 0; // real seconds
@@ -258,7 +253,6 @@ function setPhase(next: Phase) {
   phase = next;
   phaseTime = 0;
   document.body.dataset.phase = next;
-  if (next === "dying") enemies.clear();
   if (next === "over") document.getElementById("final-score")!.textContent = `Blasted ${score}`;
   if (next !== "waiting") return;
   bolts.clear();
@@ -286,7 +280,8 @@ function frame(delta: number) {
     elapsed += delta;
     player.update(delta, camera);
     if (phase === "waiting" && player.position.distanceToSquared(home) > 0.01) setPhase("playing");
-    if (phase === "playing") enemies.update(delta);
+    if (phase === "playing") enemies.hunt(delta, camera);
+    else if (phase !== "waiting") enemies.standDown(delta);
     bolts.update(delta);
     if (phase === "playing" && !player.alive) setPhase("dying");
   }
@@ -306,8 +301,7 @@ function frame(delta: number) {
   ground.mesh.position.set(player.position.x, -0.01, player.position.z);
   ground.time.value = elapsed;
   updatePaths(renderer, player.position);
-  const preset = SCENES[settings.scene];
-  grass.update(delta, elapsed, scene, camera, preset.grass, preset.light.position);
+  grass.update(delta, elapsed, scene, camera, preset.grass);
   post.render();
 }
 
