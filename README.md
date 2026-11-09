@@ -2,8 +2,6 @@
 
 ![The player firing laser bolts across the night grass](docs/screenshot.jpg)
 
-Screenshot [with HDR](docs/screenshot.jpg) (glows past white on HDR screens, in browsers that read gain maps) and [without](docs/screenshot-sdr.jpg).
-
 A little top-down shooter built mostly as an excuse to test HDR and WebGPU compute shaders in browser.
 
 **[Try it](https://tobiasmelen.github.io/hdr-blaster/)**
