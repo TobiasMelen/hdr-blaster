@@ -397,6 +397,11 @@ setPhase("title");
 for (const id of ["start", "respawn"]) document.getElementById(id)!.addEventListener("click", () => setPhase("waiting"));
 addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (phase === "title" || phase === "over")) setPhase("waiting");
+  // F: the whole page full screen, screens and settings with it, and back
+  if (event.code === "KeyF" && !event.repeat && !event.metaKey && !event.ctrlKey) {
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else void document.documentElement.requestFullscreen();
+  }
 });
 
 // ?bench: window.__burn(frames) renders frames back to back, with no wait

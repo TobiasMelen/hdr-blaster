@@ -34,7 +34,9 @@
         z-index: 1; position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
         justify-content: center; gap: 28px; padding: 16px; box-sizing: border-box; text-align: center;
         color: var(--ink); font-family: "Tektur", system-ui, sans-serif;
-        transition: opacity 0.6s ease, background-color 1.2s ease;
+        /* Once faded out a screen stops being drawn at all, leaving the view
+           the only full-size layer */
+        transition: opacity 0.6s ease, background-color 1.2s ease, visibility 0s 0.6s;
       }
       .screen h1 {
         margin: 0; color: var(--ink-bright); font-size: clamp(36px, 9vw, 112px); font-weight: 900;
@@ -58,7 +60,7 @@
          and game over over the greyed field */
       #landing { background: var(--night); }
       [data-phase="title"] #landing { background-color: rgb(7 11 22 / 0.55); }
-      body:not([data-phase="loading"], [data-phase="title"]) #landing { opacity: 0; pointer-events: none; }
+      body:not([data-phase="loading"], [data-phase="title"]) #landing { opacity: 0; visibility: hidden; pointer-events: none; }
       /* The bar and the button share a slot, so the title doesn't move */
       #landing .slot { display: grid; place-items: center; height: 52px; width: min(320px, 100%); }
       #landing .slot > * { grid-area: 1 / 1; }
@@ -72,8 +74,10 @@
       [data-phase="title"] #start { opacity: 1; visibility: visible; }
       [data-phase="loading"] .lil-gui { display: none; }
 
-      #game-over { background: rgb(0 0 0 / 0.35); opacity: 0; pointer-events: none; }
-      [data-phase="over"] #game-over { opacity: 1; pointer-events: auto; }
+      #game-over { background: rgb(0 0 0 / 0.35); opacity: 0; visibility: hidden; pointer-events: none; }
+      [data-phase="over"] #game-over {
+        opacity: 1; visibility: visible; pointer-events: auto; transition: opacity 0.6s ease, visibility 0s;
+      }
       #game-over p { margin: -8px 0 0; color: var(--ink-bright); font-size: clamp(18px, 2.4vw, 26px); }
 
       #score {

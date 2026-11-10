@@ -124,7 +124,14 @@ export function createPost(
 ) {
   const look = hdrOutput ? HDR_LOOK : SDR_LOOK;
   const boost = hdrOutput ? hdrBoost : float(0.0);
-  const scenePass = pass(scene, camera, { samples: msaa ? 4 : 0 });
+  // Nothing reads the multisampled colour or depth once the pass has
+  // resolved, so they're dropped rather than written out: a sixth of the
+  // frame at 2x
+  const scenePass = pass(scene, camera, {
+    samples: msaa ? 4 : 0,
+    storeMultisampledColorBuffer: false,
+    storeMultisampledDepthBuffer: false,
+  });
   // Materials (the bolts') merge their own outputs into this
   scenePass.setMRT(mrt({ output }));
   // The scene, as the shockwaves push it about
