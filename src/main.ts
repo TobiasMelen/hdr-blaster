@@ -3,7 +3,7 @@ import GUI from "three/examples/jsm/libs/lil-gui.module.min.js";
 import Renderer from "three/src/renderers/common/Renderer.js";
 import WebGPUBackend from "three/src/renderers/webgpu/WebGPUBackend.js";
 import StandardNodeLibrary from "three/src/renderers/webgpu/nodes/StandardNodeLibrary.js";
-import { FOOTSTEP, grassField, grassSettings, MAX_BLADE_HEIGHT, type GrassLook, type Push } from "./grass";
+import { grassField, grassSettings, MAX_BLADE_HEIGHT, type GrassLook, type Wake } from "./grass";
 import { createGround } from "./ground";
 import { createPlayer } from "./player";
 import { createEnemies } from "./enemies";
@@ -144,19 +144,20 @@ const moon = new THREE.Mesh(
 scene.add(ambient, sun, moon);
 
 const stains = new Stains();
-// Everything that flattens the grass, and how: the player, enemies while
-// around, and bolts in flight
-const grassPushers = new Map<THREE.Vector3, Push>();
-const bolts = new BoltPool(stains, grassPushers);
+// Feet that flatten the grass: the player's, and enemies' while around
+const grassFeet = new Set<THREE.Vector3>();
+// And the wakes bolts leave in it
+const grassWakes = new Set<Wake>();
+const bolts = new BoltPool(stains, grassWakes);
 const [ground, botAssets] = await Promise.all([createGround(), loadBotAssets()]);
 const player = createPlayer(botAssets, bolts, createControls(renderer.domElement));
 const home = player.position.clone();
-grassPushers.set(player.position, FOOTSTEP);
+grassFeet.add(player.position);
 // Kills this life, shown bottom left and on the game over screen
 let score = 0;
 const setScore = (value: number) => (document.getElementById("score-value")!.textContent = String((score = value)));
-const enemies = createEnemies(botAssets, bolts, grassPushers, player.position, () => setScore(score + 1));
-const grass = grassField(renderer, stains, grassPushers, player.position);
+const enemies = createEnemies(botAssets, bolts, grassFeet, player.position, player.velocity, () => setScore(score + 1));
+const grass = grassField(renderer, stains, grassFeet, grassWakes, player.position);
 scene.add(ground.mesh, grass.mesh, player.object, enemies.object, bolts.group);
 progress(0.75);
 const makePost = () => createPost(renderer, scene, camera, settings);
@@ -259,6 +260,7 @@ grassGui.add(grassSettings, "bladeHeight", 0.7, MAX_BLADE_HEIGHT, 0.1).name("Bla
 grassGui.add(grassSettings, "windSpeed", 0, 5, 0.1).name("Wind Speed");
 grassGui.add(grassSettings, "trailRecovery", 0.2, 20, 0.1).name("Trail Recovery");
 grassGui.add(grassSettings, "bladeLit").name("Blade Lighting").onChange(resize);
+grassGui.add(grassSettings, "boltWakes").name("Bolt Wakes").onChange(resize);
 
 // Where the game is: loading, the title screen, waiting for the player's
 // first move (enemies held off), playing, dying (enemies standing down,

@@ -83,6 +83,7 @@ export function createPlayer(assets: BotAssets, bolts: BoltPool, controls: Contr
   return {
     object,
     position: bot.position,
+    velocity: bot.velocity,
     aim,
     update,
     revive,

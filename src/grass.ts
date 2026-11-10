@@ -36,6 +36,9 @@ import {
   uint,
   Loop,
   positionViewDirection,
+  pow2,
+  pow3,
+  inverseSqrt,
 } from "three/tsl";
 import { ISO_ELEVATION, ISO_OFFSET, ISO_RIGHT, ISO_UP } from "./iso";
 import { hash12, hash22, noise } from "./tslNoise";
@@ -47,12 +50,10 @@ import { MAX_STAINS, type Stains } from "./stains";
 const TRAIL_RES = 512;
 const TRAIL_SIZE = 80;
 const TRAIL_TEXEL = TRAIL_SIZE / TRAIL_RES;
-// How wide and how hard something moving through the grass pushes it over
-// at its centre, and how many times faster than trailRecovery the grass
-// springs back from it (a whole number): feet (the player's and the
-// enemies'), and others
-export type Push = { radius: number; strength: number; recovery: number };
-export const FOOTSTEP: Push = { radius: 1.0, strength: 0.95, recovery: 1 };
+// How wide a foot moving through the grass pushes it over, and how hard at
+// its centre: the player's and the enemies'
+const FOOT_RADIUS = 1.0;
+const FOOT_STRENGTH = 0.95;
 // How hard blood pushes the blades it lands on, away from the impact: less
 // than a footstep
 const STAIN_PUSH = 0.7;
@@ -61,18 +62,54 @@ const STAIN_PUSH = 0.7;
 const STAIN_PAINT_SIZE = 22;
 const STAIN_PAINT_AHEAD = 6.5;
 const STAIN_CELLS = Math.ceil(STAIN_PAINT_SIZE / TRAIL_TEXEL);
-// Most things pushing the grass at once: the player, the enemies and the
-// bolts in flight
-const MAX_PUSHERS = 20;
-// Where unused pusher slots sit, far from any grass
+// Most feet in the grass at once: the player and the enemies
+const MAX_FEET = 6;
+// Furthest a foot is taken to have moved in a frame (metres); further, and
+// it's stamped only where it is, so a jump doesn't streak across the field
+const MAX_STRIDE = 1;
+// Square of cells stamped around each foot: its reach either way of the
+// middle of its stride
+const FOOT_CELLS = Math.ceil((2 * FOOT_RADIUS + MAX_STRIDE) / TRAIL_TEXEL);
+// Where unused foot slots sit, far from any grass
 const NOWHERE = 1e6;
 // Reach of a stain slot with nothing to paint
 const NOT_PAINTING = -1e3;
 // Most point lights the grass lights itself with (the bolts' are 14)
 const MAX_GRASS_LIGHTS = 16;
 
+// Bolt wakes: the air a bolt's heat sucks in behind it, worked out per
+// blade from the bolt's path and how long ago it passed, so nothing is
+// kept from frame to frame. It's drawn into pockets strung along the
+// bolt's line, a little uneven, that stream on after the bolt, each
+// pulling the blades around it in and along the way the bolt went, so the
+// line breaks up into soft swirls trailing the bolt rather than one long
+// furrow. Most wakes at once, how long each lasts after the bolt passed,
+// dying down from the moment it did (seconds), how hard it pulls, how far
+// apart its pockets are and how far each reaches (metres), how fast they
+// stream after the bolt (metres per second), and how much of the pull is
+// along after it rather than in towards the pocket
+const MAX_WAKES = 16;
+const WAKE_LIFE = 0.9;
+const SUCTION = 0.6;
+const SUCTION_SPACING = 3;
+const SUCTION_RADIUS = 3;
+const SUCTION_DRIFT = 4;
+const SUCTION_FOLLOW = 0.7;
+
+// A bolt's wake: where it was fired from and the way it flew (on the
+// ground), how fast, how far its front got, and seconds since it was
+// fired, which the grass counts up. Its pockets are placed by where it was
+// fired from, so each wake's are its own
+export type Wake = {
+  origin: THREE.Vector2;
+  direction: THREE.Vector2;
+  speed: number;
+  reach: number;
+  age: number;
+};
+
 // Blades lean past the edges of their footprint by up to this much: wind
-// (~1.4 m at full gust on soft blades), trail push (up to FOOTSTEP.strength m) and rest bend
+// (~1.4 m at full gust on soft blades), trail push (up to FOOT_STRENGTH m) and rest bend
 const BEND_MARGIN = 3.0;
 
 // The view's ground axes, and the ground direction towards the camera
@@ -158,11 +195,12 @@ function createBladeGeometry(bladeCount: number) {
 
 // The trail and blood maps, the only grass state kept from frame to frame,
 // so they outlive rebuilds.
-// The trail map wraps around the world, so it covers the ball wherever it
-// rolls: each cell holds the xz push vector (bend direction scaled by
-// strength) that blades rooted there get, a life that counts down from 1
-// so the blades recover with an ease-out, and the id of the world tile it
-// currently covers, so cells reused for a new tile read as empty.
+// The trail map wraps around the world, so it covers the player wherever
+// it goes: each cell holds the xz push vector (bend direction scaled by
+// strength) that blades rooted there get, when it was pushed, so the
+// blades recover with an ease-out from then without the map being visited
+// every frame, and the id of the world tile it currently covers, so cells
+// reused for a new tile read as empty.
 // The blood map is over the same cells: how bloody, and the tile id
 function createMaps() {
   const trailMap = instancedArray(TRAIL_RES * TRAIL_RES, "vec4");
@@ -186,6 +224,7 @@ function createGrass(
   bladeCount: number,
   stains: Stains,
   bladeLit: boolean,
+  boltWakes: boolean,
   { trailMap, bloodMap }: ReturnType<typeof createMaps>
 ) {
   const uniforms = {
@@ -197,14 +236,16 @@ function createGrass(
     cellSize: uniform(0.13),
     windSpeed: uniform(1),
     grassHeight: uniform(1.3),
-    spherePosition: uniform(new THREE.Vector3(0, 1, 0)),
-    // Each pusher's path this frame: last frame's xz then this frame's
-    pushers: Array.from({ length: MAX_PUSHERS }, () =>
-      uniform(new THREE.Vector4(NOWHERE, NOWHERE, NOWHERE, NOWHERE))
-    ),
-    // And each one's radius and strength
-    pushes: Array.from({ length: MAX_PUSHERS }, () => uniform(new THREE.Vector3(1, 0, 1))),
-    trailFadeStep: uniform(0),
+    playerPosition: uniform(new THREE.Vector3(0, 1, 0)),
+    // Each foot's path this frame: last frame's xz then this frame's
+    feet: vec4Array(Array.from({ length: MAX_FEET }, () => new THREE.Vector4().setScalar(NOWHERE))),
+    // Bolt wakes: each wake's origin and direction, then its age, reach,
+    // speed, and a seed for where its pockets go
+    wakeCount: uniform(0, "int"),
+    wakePaths: vec4Array(Array.from({ length: MAX_WAKES }, () => new THREE.Vector4())),
+    wakeTimes: vec4Array(Array.from({ length: MAX_WAKES }, () => new THREE.Vector4())),
+    // How much of a push's life fades per second
+    trailFade: uniform(0),
     tipTint: uniform(new THREE.Vector3(1.0, 0.9, 0.6)),
     wetness: uniform(0),
     specular: uniform(new THREE.Color(0x000000)),
@@ -228,10 +269,13 @@ function createGrass(
   // frame's compute has already run on stale values; these must upload on
   // every dispatch
   for (const array of [
+    uniforms.feet,
     uniforms.stains,
     uniforms.stainReach,
     uniforms.lightPositions,
     uniforms.lightColors,
+    uniforms.wakePaths,
+    uniforms.wakeTimes,
   ]) {
     array.updateType = THREE.NodeUpdateType.OBJECT;
   }
@@ -244,68 +288,45 @@ function createGrass(
     return { index: int(wrapped.y).mul(TRAIL_RES).add(int(wrapped.x)), tile };
   };
 
-  // Springs up fast, then settles gently into rest over a fixed time
-  const recovery = (life: THREE.Node<"float">) => life.mul(life);
-  // A cell's life shares its third channel with how fast it recovers: the
-  // speed in the whole part, the life in the fraction (full is just under 1)
-  const FULL_LIFE = 0.999;
-  const lifeOf = (z: THREE.Node<"float">) => fract(z);
-  const speedOf = (z: THREE.Node<"float">) => floor(z);
-
-  // Fade the map back towards rest, then stamp the pushers' footprints
-  const stampTrail = Fn(() => {
-    const cell = vec2(
-      float(instanceIndex.mod(TRAIL_RES)),
-      float(instanceIndex.div(TRAIL_RES))
-    );
-    // World position of this cell in the tile nearest the ball
-    const tilePos = cell.add(0.5).mul(TRAIL_TEXEL);
-    const tile = floor(
-      uniforms.spherePosition.xz.sub(tilePos).div(TRAIL_SIZE).add(0.5)
-    ).toVar();
-    const cellPos = tilePos.add(tile.mul(TRAIL_SIZE));
-    const id = tileId(tile).toVar();
-
-    const trail = trailMap.element(instanceIndex);
-    const speed = speedOf(trail.z).toVar();
-    const life = select(
-      trail.w.equal(id),
-      max(lifeOf(trail.z).sub(uniforms.trailFadeStep.mul(speed)), 0.0),
-      0.0
-    ).toVar();
-    const current = trail.xy.mul(recovery(life)).toVar();
-
-    // Capsule from each pusher's last frame position to this frame's, so
-    // fast movement leaves a continuous trail; the strongest one counts
-    const stamp = vec2(0.0).toVar();
-    const stampSpeed = float(1.0).toVar();
-    uniforms.pushers.forEach((path, i) => {
-      const size = uniforms.pushes[i];
-      const segStart = path.xy;
-      const segment = path.zw.sub(segStart);
-      const t = clamp(
-        dot(cellPos.sub(segStart), segment).div(max(dot(segment, segment), 1e-6)),
-        0.0,
-        1.0
-      );
-      const toCell = cellPos.sub(segStart.add(segment.mul(t)));
-      const distance = length(toCell);
-      const strength = smoothstep(0.0, 1.0, float(1.0).sub(distance.div(size.x))).mul(size.y);
-      const push = toCell.div(max(distance, 0.001)).mul(strength);
-      const stronger = dot(push, push).greaterThan(dot(stamp, stamp));
-      stampSpeed.assign(select(stronger, size.z, stampSpeed));
-      stamp.assign(select(stronger, push, stamp));
+  // The push a trail cell gives now, or none if it holds another tile: its
+  // life runs out over the recovery time from when it was pushed, and the
+  // blades spring up fast, then settle gently into rest
+  const trailPush = (index: THREE.Node<"int">, id: THREE.Node<"float">) => {
+    const trail = trailMap.element(index);
+    const life = saturate(uniforms.time.sub(trail.z).mul(uniforms.trailFade).oneMinus());
+    return select(trail.w.equal(id), trail.xy.mul(life.mul(life)), vec2(0.0));
+  };
+  // Pushes a trail cell's blades over, unless they're already pushed
+  // harder, so a new push never weakens a trail
+  const pushTrail = (index: THREE.Node<"int">, id: THREE.Node<"float">, push: THREE.Node<"vec2">) => {
+    const current = trailPush(index, id);
+    If(dot(push, push).greaterThan(dot(current, current)), () => {
+      trailMap.element(index).assign(vec4(push, uniforms.time, id));
     });
+  };
 
-    // Strongest push wins, so the stamp never weakens an existing trail
-    trail.assign(
-      select(
-        dot(stamp, stamp).greaterThan(dot(current, current)),
-        vec4(stamp, stampSpeed.add(FULL_LIFE), id),
-        vec4(trail.xy, speed.add(life), id)
-      )
-    );
-  })().compute(TRAIL_RES * TRAIL_RES);
+  // Footprints: a capsule from each foot's last frame position to this
+  // frame's, so fast movement leaves a continuous trail, stamped over a
+  // square of cells around it
+  const FOOT_AREA = FOOT_CELLS * FOOT_CELLS;
+  const stampFeet = Fn(() => {
+    const path = uniforms.feet.element(instanceIndex.div(FOOT_AREA));
+    If(path.x.lessThan(NOWHERE / 2), () => {
+      const local = instanceIndex.mod(FOOT_AREA);
+      const c = floor(path.xy.add(path.zw).mul(0.5).div(TRAIL_TEXEL))
+        .sub(FOOT_CELLS / 2)
+        .add(vec2(float(local.mod(FOOT_CELLS)), float(local.div(FOOT_CELLS))))
+        .toVar();
+      const pos = c.add(0.5).mul(TRAIL_TEXEL);
+      const segment = path.zw.sub(path.xy);
+      const t = clamp(dot(pos.sub(path.xy), segment).div(max(dot(segment, segment), 1e-6)), 0.0, 1.0);
+      const toCell = pos.sub(path.xy.add(segment.mul(t))).toVar();
+      const distance = length(toCell);
+      const strength = smoothstep(0.0, 1.0, float(1.0).sub(distance.div(FOOT_RADIUS))).mul(FOOT_STRENGTH);
+      const { index, tile } = wrapCell(c);
+      pushTrail(index, tileId(tile), toCell.div(max(distance, 0.001)).mul(strength));
+    });
+  })().compute(MAX_FEET * FOOT_AREA);
 
   // Blood: a cone sprayed out from the splat the way the bolt was going,
   // solid near its start and breaking up towards its ragged far end, with
@@ -353,14 +374,9 @@ function createGrass(
       });
 
       // The blades it lands on pushed over away from the impact, by how
-      // bloody they are; the strongest push wins, as with trails
+      // bloody they are
       const away = pos.sub(stain.xy);
-      const push = away.div(max(length(away), 0.001)).mul(blood.mul(STAIN_PUSH)).toVar();
-      const trail = trailMap.element(index);
-      const pushed = select(trail.w.equal(id), trail.xy.mul(recovery(lifeOf(trail.z))), vec2(0.0));
-      If(dot(push, push).greaterThan(dot(pushed, pushed)), () => {
-        trail.assign(vec4(push, 1.0 + FULL_LIFE, id));
-      });
+      pushTrail(index, id, away.div(max(length(away), 0.001)).mul(blood.mul(STAIN_PUSH)));
     });
   })().compute(MAX_STAINS * STAIN_AREA);
 
@@ -372,18 +388,62 @@ function createGrass(
     // Unwrapped cell -> push, or none if the cell holds another tile
     const at = (c: THREE.Node<"vec2">) => {
       const { index, tile } = wrapCell(c);
-      const trail = trailMap.element(index);
-      return select(
-        trail.w.equal(tileId(tile)),
-        trail.xy.mul(recovery(lifeOf(trail.z))),
-        vec2(0.0)
-      );
+      return trailPush(index, tileId(tile));
     };
     return mix(
       mix(at(c0), at(c0.add(vec2(1.0, 0.0))), f.x),
       mix(at(c0.add(vec2(0.0, 1.0))), at(c0.add(vec2(1.0, 1.0))), f.x),
       f.y
     );
+  });
+
+  // How the bolts' wakes pull a blade rooted at a world xz position: in
+  // towards the two pockets either side of it along each bolt's line and
+  // on after the bolt, each pocket a little off its even spacing and of its
+  // own strength, streaming after the bolt, strongest the moment it passed
+  // and dying away. Only along the stretch the bolt flew, from when its
+  // front passed, and within a pocket's reach of its line
+  const wakePush = Fn(([pos]: [THREE.Node<"vec2">]) => {
+    const push = vec2(0.0).toVar();
+    Loop(uniforms.wakeCount, ({ i }) => {
+      const path = uniforms.wakePaths.element(i);
+      const times = uniforms.wakeTimes.element(i);
+      const offset = pos.sub(path.xy);
+      const side = vec2(path.w.negate(), path.z);
+      const along = dot(offset, path.zw).toVar();
+      const across = dot(offset, side).toVar();
+      const age = times.x.sub(along.div(times.z)).toVar();
+      If(
+        along
+          .greaterThan(0.0)
+          .and(along.lessThan(times.y))
+          .and(age.greaterThan(0.0))
+          .and(age.lessThan(WAKE_LIFE))
+          .and(abs(across).lessThan(SUCTION_RADIUS)),
+        () => {
+          const drift = age.mul(SUCTION_DRIFT).toVar();
+          const first = floor(along.sub(drift).div(SUCTION_SPACING).sub(0.5)).toVar();
+          const inwards = vec2(0.0).toVar();
+          const total = float(0.0).toVar();
+          for (const next of [0, 1]) {
+            const pocket = first.add(next);
+            const vary = hash22(vec2(pocket, times.w));
+            const middle = pocket.add(0.5).add(vary.x.sub(0.5).mul(0.6)).mul(SUCTION_SPACING).add(drift);
+            const toMiddle = path.zw.mul(middle.sub(along)).sub(side.mul(across)).toVar();
+            const squared = dot(toMiddle, toMiddle).toVar();
+            const pull = pow2(saturate(squared.div(SUCTION_RADIUS * SUCTION_RADIUS).oneMinus()))
+              .mul(vary.y.mul(0.4).add(0.6))
+              .toVar();
+            // Eased into the middle, so the blades there don't flip
+            inwards.addAssign(toMiddle.mul(inverseSqrt(max(squared, 0.16))).mul(pull));
+            total.addAssign(pull);
+          }
+          const strength = pow3(age.div(WAKE_LIFE).oneMinus()).mul(SUCTION);
+          push.addAssign(inwards.mul(1 - SUCTION_FOLLOW).add(path.zw.mul(total.mul(SUCTION_FOLLOW))).mul(strength));
+        }
+      );
+    });
+    return push;
   });
 
   // Per-frame per-blade data, packed for the vertex shader (3 vec4 per vertex)
@@ -504,8 +564,13 @@ function createGrass(
       .sub(windSpeed.mul(0.5))
       .toVar();
 
-    // Ball trail from the trail map: push direction and strength
+    // Trail from the trail map: push direction and strength, and the
+    // bolts' wakes on top, held to a footstep's push
     const trailBend = sampleTrail(grassPos).toVar();
+    if (boltWakes) {
+      trailBend.addAssign(wakePush(grassPos));
+      trailBend.mulAssign(float(FOOT_STRENGTH).div(max(length(trailBend), FOOT_STRENGTH)));
+    }
 
     // Wind and trail both bend linearly with uv.y in xz and droop with uv.y^3
     const linearBend = vec2(totalWind, totalWind.mul(0.3))
@@ -534,9 +599,9 @@ function createGrass(
     };
     const blood = max(bloodAt(grassPos), bloodAt(grassPos.add(restBend)));
 
-    // Shadow effect from sphere
-    const distanceToSphere = length(grassPos.sub(uniforms.spherePosition.xz));
-    const shadowStrength = smoothstep(0.0, 2.0, distanceToSphere).oneMinus().mul(0.8);
+    // Shadow under the player
+    const distanceToPlayer = length(grassPos.sub(uniforms.playerPosition.xz));
+    const shadowStrength = smoothstep(0.0, 2.0, distanceToPlayer).oneMinus().mul(0.8);
 
     if (bladeLightRoot && bladeLightTip) {
       // Lit on the side the camera sees
@@ -582,7 +647,7 @@ function createGrass(
     const uvY2 = uvY.mul(uvY);
     const uvY3 = uvY2.mul(uvY);
 
-    // Initial resting bend (uv.y^2 curve) plus wind + sphere trail (linear)
+    // Initial resting bend (uv.y^2 curve) plus wind + trail (linear)
     const offsetXZ = restBend.mul(uvY2).add(bend.xy.mul(uvY));
 
     // Length compensation for all bends
@@ -685,14 +750,14 @@ function createGrass(
 
   return {
     uniforms,
-    stampTrail,
+    stampFeet,
     paintStains,
     update,
     material,
     dispose: () => {
       material.dispose();
       for (const buffer of buffers) buffer?.value.dispose?.();
-      for (const compute of [stampTrail, paintStains, update]) compute.dispose();
+      for (const compute of [stampFeet, paintStains, update]) compute.dispose();
     },
   };
 }
@@ -707,6 +772,7 @@ export type GrassLook = {
 };
 
 const viewDirection = new THREE.Vector3();
+const stride = new THREE.Vector2();
 const lightColor = new THREE.Color();
 const lightPosition = new THREE.Vector3();
 const targetPosition = new THREE.Vector3();
@@ -776,6 +842,9 @@ export const grassSettings = {
   // Lights the grass itself, point lights once per blade, instead of with
   // three's per pixel lights
   bladeLit: true,
+  // Bolts suck the grass in behind them as they pass. Off, they leave it
+  // be, and none of it is built into the shaders
+  boltWakes: true,
 };
 
 // The grass field: a mesh to add to the scene, rebuild() whenever the view's
@@ -783,9 +852,11 @@ export const grassSettings = {
 export function grassField(
   renderer: THREE.WebGPURenderer,
   stains: Stains,
-  // Positions that flatten the grass as they move, and how, at most
-  // MAX_PUSHERS
-  pushers: Map<THREE.Vector3, Push>,
+  // Feet that flatten the grass as they move, at most MAX_FEET
+  feet: Set<THREE.Vector3>,
+  // Wakes the bolts leave, oldest first; the grass ages them and drops them
+  // once spent, or straight away with bolt wakes off
+  wakes: Set<Wake>,
   // Where the player is, for the shadow under it
   player: THREE.Vector3
 ) {
@@ -797,14 +868,14 @@ export function grassField(
   mesh.renderOrder = -1;
   const maps = createMaps();
   let grass: ReturnType<typeof createGrass>;
-  let lastPushers = new Map<THREE.Vector3, THREE.Vector2>();
+  let lastFeet = new Map<THREE.Vector3, THREE.Vector2>();
   // Slot grid covering the ground the fixed iso view sees, in the view's
   // ground axes relative to the point at the centre of the screen
   const grid = { cellSize: 1, columns: 0, minRight: 0, minUp: 0 };
 
   // The view's size in world units, across and up the screen
   function rebuild(viewWidth: number, viewHeight: number) {
-    const { density, bladeLit } = grassSettings;
+    const { density, bladeLit, boltWakes } = grassSettings;
     grid.cellSize = 1 / Math.sqrt(density);
     const width = viewWidth + 2 * BEND_MARGIN;
     const depth = viewHeight / Math.sin(ISO_ELEVATION);
@@ -816,7 +887,7 @@ export function grassField(
     const bladeCount = grid.columns * Math.ceil((depth + nearMargin + BEND_MARGIN) / grid.cellSize);
 
     dispose();
-    grass = createGrass(bladeCount, stains, bladeLit, maps);
+    grass = createGrass(bladeCount, stains, bladeLit, boltWakes, maps);
     mesh.geometry = createBladeGeometry(bladeCount);
     mesh.material = grass.material;
     grass.uniforms.gridWidth.value = grid.columns;
@@ -839,12 +910,12 @@ export function grassField(
     uniforms.time.value = time;
     uniforms.windSpeed.value = grassSettings.windSpeed;
     uniforms.grassHeight.value = grassSettings.bladeHeight;
-    uniforms.trailFadeStep.value = delta / grassSettings.trailRecovery;
+    uniforms.trailFade.value = 1 / grassSettings.trailRecovery;
     uniforms.specular.value.set(look.specular);
     uniforms.shininess.value = look.shininess;
     uniforms.tipTint.value.fromArray(look.tipTint);
     uniforms.wetness.value = look.wetness;
-    uniforms.spherePosition.value.copy(player);
+    uniforms.playerPosition.value.copy(player);
     if (grassSettings.bladeLit) mirrorLights(scene, camera, uniforms);
 
     // Ground point at the centre of the screen, in view ground axes
@@ -859,22 +930,35 @@ export function grassField(
       Math.floor((up + grid.minUp) / grid.cellSize)
     );
 
-    // Each pusher's path since last frame; one that just joined starts
-    // where it is, so a spawn doesn't streak across the field
+    // Each foot's path since last frame; one that just joined starts where
+    // it is, so a spawn doesn't streak across the field
     const seen = new Map<THREE.Vector3, THREE.Vector2>();
     let slot = 0;
-    for (const [position, push] of pushers) {
-      if (slot === MAX_PUSHERS) break;
-      const last = lastPushers.get(position) ?? new THREE.Vector2(position.x, position.z);
-      uniforms.pushes[slot].value.set(push.radius, push.strength, push.recovery);
-      uniforms.pushers[slot++].value.set(last.x, last.y, position.x, position.z);
+    for (const position of feet) {
+      if (slot === MAX_FEET) break;
+      const last = lastFeet.get(position) ?? new THREE.Vector2(position.x, position.z);
+      if (last.distanceTo(stride.set(position.x, position.z)) > MAX_STRIDE) last.copy(stride);
+      uniforms.feet.array[slot++].set(last.x, last.y, position.x, position.z);
       seen.set(position, last.set(position.x, position.z));
     }
-    for (; slot < MAX_PUSHERS; slot++) uniforms.pushers[slot].value.setScalar(NOWHERE);
-    lastPushers = seen;
+    for (; slot < MAX_FEET; slot++) uniforms.feet.array[slot].setScalar(NOWHERE);
+    lastFeet = seen;
 
-    renderer.compute(grass.stampTrail);
+    // The newest MAX_WAKES wakes still pulling; with bolt wakes off, none
+    let count = 0;
+    for (const wake of wakes) {
+      wake.age += delta;
+      const spent = wake.age > wake.reach / wake.speed + WAKE_LIFE;
+      if (spent || wakes.size > MAX_WAKES || !grassSettings.boltWakes) {
+        wakes.delete(wake);
+        continue;
+      }
+      uniforms.wakePaths.array[count].set(wake.origin.x, wake.origin.y, wake.direction.x, wake.direction.y);
+      uniforms.wakeTimes.array[count++].set(wake.age, wake.reach, wake.speed, wake.origin.x + wake.origin.y * 7.3);
+    }
+    uniforms.wakeCount.value = count;
 
+    renderer.compute(grass.stampFeet);
 
     // Stains are painted while they spread as their blood lands
     stains.update(delta);

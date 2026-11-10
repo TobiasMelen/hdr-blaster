@@ -1,7 +1,6 @@
 import * as THREE from "three/webgpu";
 import { Bot, type BotAssets } from "./bot";
 import type { BoltPool, Target } from "./bolts";
-import { FOOTSTEP, type Push } from "./grass";
 
 // Gold enemy bots: they appear past the top of the screen, walk down
 // towards the player, then hold at range, strafing and shooting. One player
@@ -24,6 +23,11 @@ const ATTACK_RANGE = 12; // holds about this far from the player
 // skipped, so one arriving waits out the rest of its tick
 const FIRE_INTERVAL: [number, number] = [0.9, 1.6];
 const AIM_ERROR = 0.15; // radians either side
+// Shooting at a player moving across their line, how likely a miss falls
+// behind it rather than ahead, where it would look led, and how fast
+// across (metres per second) it has to be going for that to be sure
+const BEHIND_CHANCE = 0.8;
+const CROSSING_SPEED = 2;
 const PERSONAL_SPACE = 2.2; // metres kept between enemies
 
 const HIT_RADIUS = 0.6;
@@ -51,8 +55,9 @@ const random = (min: number, max: number) => min + Math.random() * (max - min);
 export function createEnemies(
   assets: BotAssets,
   bolts: BoltPool,
-  grassPushers: Map<THREE.Vector3, Push>,
+  grassFeet: Set<THREE.Vector3>,
   player: THREE.Vector3,
+  playerVelocity: THREE.Vector3,
   // Each enemy blown apart
   onKill: () => void
 ) {
@@ -64,7 +69,7 @@ export function createEnemies(
     enemy.active = false;
     enemy.bot.object.visible = false;
     bolts.targets.delete(enemy.target);
-    grassPushers.delete(enemy.bot.position);
+    grassFeet.delete(enemy.bot.position);
   };
   for (let i = 0; i < MAX_ENEMIES; i++) {
     const bot = new Bot(assets, "gold");
@@ -105,7 +110,7 @@ export function createEnemies(
     enemy.strafe = Math.random() < 0.5 ? -1 : 1;
     enemy.strafeTimer = random(1.5, 3);
     bolts.targets.add(enemy.target);
-    grassPushers.set(bot.position, FOOTSTEP);
+    grassFeet.add(bot.position);
   }
 
   // Eases towards intent (kept apart from the others) and faces the player
@@ -123,7 +128,8 @@ export function createEnemies(
 
   // Arrivals, then each closes in until at range and circles the player,
   // easing in or out to hold that range, and shoots at it, not quite dead
-  // on, but only from inside the camera's view
+  // on and mostly behind it when it's moving, but only from inside the
+  // camera's view
   function hunt(delta: number, camera: THREE.OrthographicCamera) {
     spawnTimer -= delta;
     if (spawnTimer <= 0) {
@@ -162,7 +168,11 @@ export function createEnemies(
       onScreen.copy(bot.position).project(camera);
       if (Math.abs(onScreen.x) < 0.95 && Math.abs(onScreen.y) < 0.95) {
         shot.copy(player).sub(bot.muzzle).setY(0).normalize();
-        shot.applyAxisAngle(THREE.Object3D.DEFAULT_UP, random(-AIM_ERROR, AIM_ERROR));
+        // Turning the shot by a positive angle swings it towards (z, -x)
+        const crossing = playerVelocity.x * shot.z - playerVelocity.z * shot.x;
+        const behind = 0.5 + (BEHIND_CHANCE - 0.5) * Math.min(Math.abs(crossing) / CROSSING_SPEED, 1);
+        const side = (Math.random() < behind ? -1 : 1) * Math.sign(crossing || 1);
+        shot.applyAxisAngle(THREE.Object3D.DEFAULT_UP, side * random(0, AIM_ERROR));
         bolts.fire("enemy", bot.muzzle, shot);
         bot.recoil();
       }

@@ -9,7 +9,7 @@ import {
   vec3,
 } from "three/tsl";
 import { Debris, type DebrisStyle } from "./debris";
-import type { Push } from "./grass";
+import type { Wake } from "./grass";
 import type { Stains } from "./stains";
 
 // Red laser bolts, shared by everyone who shoots. Each flies level from
@@ -39,10 +39,6 @@ const LIGHT_RANGE = 14;
 // The light flashes this many times brighter as the orb leaves the muzzle,
 // dying down as it stretches into a bolt
 const MUZZLE_FLASH = 2;
-
-// The shallow furrow a bolt parts in the grass as it flies over, springing
-// back like after a gust
-const FURROW: Push = { radius: 2, strength: 0.3, recovery: 22 };
 
 // The burst on a hit: the bolt bursts into its debris, thrown from along
 // its front, and its light flashes and dies over BURST_TIME
@@ -117,13 +113,21 @@ type Bolt = {
   // Distance of the front end from the origin; once bursting, from the
   // impact
   head: number;
-  // Where the front end is, on the ground, while it furrows the grass
-  front: THREE.Vector3;
+  // Its wake in the grass, from the latest time it was fired: its own, so
+  // it pulls on after the bolt is gone or reused
+  wake: Wake;
   state: "idle" | "flying" | "bursting";
   time: number; // seconds in that state
 };
 
-
+// A wake not yet anywhere
+const newWake = (): Wake => ({
+  origin: new THREE.Vector2(),
+  direction: new THREE.Vector2(),
+  speed: BOLT_SPEED,
+  reach: 0,
+  age: 0,
+});
 
 const yAxis = new THREE.Vector3(0, 1, 0);
 const toTarget = new THREE.Vector2();
@@ -151,11 +155,11 @@ export class BoltPool {
 
   private readonly stains: Stains;
 
-  private readonly pushers: Map<THREE.Vector3, Push>;
+  private readonly wakes: Set<Wake>;
 
-  constructor(stains: Stains, pushers: Map<THREE.Vector3, Push>) {
+  constructor(stains: Stains, wakes: Set<Wake>) {
     this.stains = stains;
-    this.pushers = pushers;
+    this.wakes = wakes;
     // Over-bright so it stays saturated deep red after tone mapping, and
     // flagged for the selective bloom pass by a zero alpha
     this.material.colorNode = vec3(4.5, 0.12, 0.075);
@@ -176,7 +180,7 @@ export class BoltPool {
         origin: new THREE.Vector3(),
         direction: new THREE.Vector3(),
         head: 0,
-        front: new THREE.Vector3(),
+        wake: newWake(),
         state: "idle",
         time: 0,
       });
@@ -204,11 +208,10 @@ export class BoltPool {
     bolt.direction.copy(direction).setY(0).normalize();
     bolt.mesh.quaternion.setFromUnitVectors(yAxis, bolt.direction);
     bolt.mesh.visible = true;
-    // A new point to the grass, so a reused bolt doesn't streak from where
-    // it last was
-    this.pushers.delete(bolt.front);
-    bolt.front = new THREE.Vector3(muzzle.x, 0, muzzle.z);
-    this.pushers.set(bolt.front, FURROW);
+    bolt.wake = newWake();
+    bolt.wake.origin.set(muzzle.x, muzzle.z);
+    bolt.wake.direction.set(bolt.direction.x, bolt.direction.z);
+    this.wakes.add(bolt.wake);
   }
 
   update(delta: number) {
@@ -239,7 +242,7 @@ export class BoltPool {
         continue;
       }
       bolt.head = head;
-      bolt.front.copy(bolt.origin).addScaledVector(bolt.direction, head).setY(0);
+      bolt.wake.reach = head;
 
       bolt.mesh.position
         .copy(bolt.origin)
@@ -259,7 +262,8 @@ export class BoltPool {
       (target.position.z - bolt.origin.z) * bolt.direction.z;
     impact.copy(bolt.origin).addScaledVector(bolt.direction, along);
     const length = Math.min(BOLT_LENGTH * bolt.mesh.scale.y * BURST_ALONG, along);
-    this.pushers.delete(bolt.front);
+    // The wake ends where the bolt did, and pulls on without it
+    bolt.wake.reach = along;
     bolt.state = "bursting";
     bolt.time = 0;
     bolt.origin.copy(impact);
@@ -305,7 +309,6 @@ export class BoltPool {
   }
 
   private end(bolt: Bolt) {
-    this.pushers.delete(bolt.front);
     bolt.state = "idle";
     bolt.mesh.visible = false;
     bolt.light.intensity = 0;
